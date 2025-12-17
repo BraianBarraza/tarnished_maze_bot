@@ -1,0 +1,30 @@
+[versions]
+# change this version if required
+mazegame = "1.0.2025.4.pre"
+
+# probably you want to leave these as they are, unless you know what you are doing
+kotlin = "2.2.20"
+kotlinxCoroutines = "1.10.2"
+shadow = "8.1.1"
+dokka = "1.9.20"
+lombok = "1.18.32"
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+shadow-jar = { id = "com.github.johnrengelman.shadow", version.ref = "shadow" }
+jetbrains-dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }
+
+# --- Bibliotheken ------------------------------------------------------
+[libraries]
+lombok = { module = "org.projectlombok:lombok", version.ref = "lombok" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+maze-common = { module = "de.dreamcube.maze:mazegame-common", version.ref = "mazegame" }
+maze-client = { module = "de.dreamcube.maze:mazegame-client-ktor", version.ref = "mazegame" }
+maze-ui = { module = "de.dreamcube.maze:mazegame-ui", version.ref = "mazegame" }
+
+# --- Test-Libs
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter-engine", version = "5.8.2" }
+# mockito-core              = { module = "org.mockito:mockito-core",               version = "5.6.0" }
+# mockito-junit             = { module = "org.mockito:mockito-junit-jupiter",      version = "4.8.1" }
