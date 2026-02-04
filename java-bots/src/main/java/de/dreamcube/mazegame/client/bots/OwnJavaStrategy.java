@@ -16,40 +16,47 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * A simple maze bot strategy that:
+ * Competitive maze bot strategy (multiplayer friendly).
  *
+ * <p>Main ideas:</p>
  * <ul>
- *   <li>Plans paths with BFS (shortest path on a grid).</li>
- *   <li>Avoids known-danger cells (learned after TRAP teleports) for a limited time.</li>
- *   <li>Avoids TRAP cells normally, but can step onto a trap if it is stuck (surrounded / no safe exit).</li>
- *   <li>Limits GEM hunting to a maximum number of steps.</li>
- *   <li>Optionally "detours" to pick a nearby COFFEE/FOOD (within 2 steps) when already targeting COFFEE/FOOD.</li>
+ *   <li><b>Tick-accurate path planning</b> using BFS on state (x,y,dir). Turns cost ticks, so we plan with them.</li>
+ *   <li><b>Race-aware target selection</b>: estimates if an opponent will reach a bait earlier and lowers its value.</li>
+ *   <li><b>Hysteresis (commit window)</b>: avoids switching target every tick when the world changes.</li>
+ *   <li><b>Trap learning</b>: remembers cells that triggered a TRAP teleport for a limited time.</li>
+ *   <li><b>Collision avoidance</b>: avoids stepping into cells occupied by other players and (optionally) their front cell.</li>
  * </ul>
- *
- * <p>Important note about naming: in this code {@link #isOutOfBounds(int, int)} returns {@code true} if
- * the coordinates are outside the maze.</p>
  */
-@Bot("Tarnished")
+@Bot(value = "Tarnished", flavor = "Darkness cannot drive out darkness: only light can do that")
 public class OwnJavaStrategy extends Strategy
         implements MazeEventListener,
         BaitEventListener,
         PlayerMovementListener,
         PlayerConnectionListener {
 
-    /** Maximum search range for gems (in BFS steps). Gems farther than this are ignored. */
+    /** Max gem search range in plain grid steps (cheap filter to ignore very far gems). */
     private static final int GEM_MAX_DISTANCE_STEPS = 18;
 
-    /**
-     * When the bot is targeting COFFEE or FOOD, it may take a short detour for another COFFEE/FOOD
-     * that is reachable within this many steps from the current position.
-     */
+    /** Small detour radius (in steps) when already targeting COFFEE/FOOD. */
     private static final int OPPORTUNISTIC_RADIUS_STEPS = 2;
 
-    /**
-     * How long (in ticks) a cell stays in the "danger memory" after we got teleported by a TRAP.
-     * The bot avoids these cells in SAFE mode.
-     */
+    /** How long a trap-trigger cell stays in the danger memory (ticks). */
     private static final long DANGER_TTL_TICKS = 250;
+
+    /**
+     * Target commit window in ticks.
+     * While commit is active, we only switch target if the new one is clearly better.
+     */
+    private static final long TARGET_COMMIT_TICKS = 22;
+
+    /**
+     * Minimum relative improvement (in percent) required to switch target during the commit window.
+     * Example: 25 means: newScore must be >= oldScore * 1.25 to switch.
+     */
+    private static final int SWITCH_IMPROVEMENT_PERCENT = 25;
+
+    /** Extra safety: avoid stepping into an opponent's front cell to reduce head-on teleports. */
+    private static final boolean AVOID_OPPONENT_FRONT_CELLS = true;
 
     // =========================
     // Maze state
@@ -58,50 +65,42 @@ public class OwnJavaStrategy extends Strategy
     private int width, height;
 
     /**
-     * Walkable cells map: {@code true} means the maze tile is floor and can be entered.
-     * This does NOT include dynamic hazards like TRAP baits; those are handled separately.
-     *
-     * <p>Indexing is {@code idx = y * width + x}.</p>
+     * Walkable cells map: true = floor '.'.
+     * Index: idx = y * width + x.
      */
     private boolean[] walkable;
 
-    /**
-     * Baits known by the bot, keyed by coordinate (x,y) combined into a {@code long}.
-     * We store baits by position because multiple IDs are irrelevant for pathfinding.
-     */
+    /** Baits known by the bot, stored by coordinate key (x,y). */
     private final Map<Long, Bait> baits = new ConcurrentHashMap<>();
 
-    /** Other players, used only to avoid stepping into their current cell. */
+    /** Other players (and myself) as snapshots. */
     private final Map<Integer, PlayerSnapshot> players = new ConcurrentHashMap<>();
 
     // =========================
-    // Own player state
+    // Own state
     // =========================
 
     private Integer myPlayerId = null;
     private volatile PlayerSnapshot me;
 
-    /**
-     * Current planned action queue. When empty we compute a new plan.
-     * We clear this plan on any significant world change (bait appear/vanish, teleport, etc.).
-     */
+    /** Current planned move queue. */
     private final Deque<Move> plan = new ArrayDeque<>();
 
-    /** The policy used to build the current plan (important for validating STEP moves). */
+    /** Mode used to build the current plan (important for validating planned STEPs). */
     private volatile PlanMode planMode = PlanMode.SAFE;
 
     private volatile boolean paused = false;
     private long tick = 0;
 
-    /**
-     * "Danger memory": cellKey -> expiryTick.
-     * When we get teleported by a TRAP, we mark the trigger cell (and sometimes the cell in front)
-     * as dangerous for a while.
-     */
+    /** Danger memory: cellKey -> expiryTick. */
     private final Map<Long, Long> dangerUntilTick = new ConcurrentHashMap<>();
 
+    /** Target hysteresis: last chosen target key and commit end tick. */
+    private volatile Long currentTargetKey = null;
+    private volatile long commitUntilTick = 0;
+
     // =========================
-    // Events: Maze / Baits / Players
+    // Events
     // =========================
 
     @Override
@@ -110,7 +109,7 @@ public class OwnJavaStrategy extends Strategy
         this.height = height;
         this.walkable = new boolean[width * height];
 
-        // '.' is walkable; '#', '-' and other chars are treated as walls
+        // '.' is walkable; everything else is treated as wall.
         for (int y = 0; y < height; y++) {
             String line = mazeLines.get(y);
             for (int x = 0; x < width; x++) {
@@ -125,13 +124,19 @@ public class OwnJavaStrategy extends Strategy
     @Override
     public void onBaitAppeared(@NotNull Bait bait) {
         baits.put(key(bait.getX(), bait.getY()), bait);
-        clearPlan(); // re-plan quickly when new bait appears
+        // Re-plan quickly when the world changes.
+        clearPlan();
     }
 
     @Override
     public void onBaitVanished(@NotNull Bait bait) {
         baits.remove(key(bait.getX(), bait.getY()));
-        clearPlan(); // re-plan quickly when bait is gone
+        // If our current target vanished, drop commit.
+        if (Objects.equals(currentTargetKey, key(bait.getX(), bait.getY()))) {
+            currentTargetKey = null;
+            commitUntilTick = 0;
+        }
+        clearPlan();
     }
 
     @Override
@@ -188,11 +193,9 @@ public class OwnJavaStrategy extends Strategy
                 // Mark the old position as dangerous.
                 markDanger(oldPos.getX(), oldPos.getY());
 
-                // Also mark the cell in front of old position (some traps trigger on enter).
+                // Also mark the cell in front (some traps feel "edge-triggered").
                 int[] front = frontCell(oldPos.getX(), oldPos.getY(), oldPos.getViewDirection());
-                if (front != null) {
-                    markDanger(front[0], front[1]);
-                }
+                if (front != null) markDanger(front[0], front[1]);
             }
         }
     }
@@ -203,10 +206,14 @@ public class OwnJavaStrategy extends Strategy
         }
     }
 
+    // =========================
+    // Main loop
+    // =========================
+
     /**
-     * Called every tick. Returns the next move.
+     * Called each tick by the engine to get the next move.
      *
-     * <p>We validate planned STEP moves: if the next tile is no longer allowed (e.g. another player moved),
+     * <p>We validate the next planned STEP. If the cell is no longer allowed (player moved / etc),
      * we drop the plan and re-plan.</p>
      */
     @Nullable
@@ -218,7 +225,7 @@ public class OwnJavaStrategy extends Strategy
             return Move.DO_NOTHING;
         }
 
-        // Validate the first planned STEP (only the first one).
+        // Validate only the first planned STEP (cheap).
         if (!plan.isEmpty() && plan.peekFirst() == Move.STEP) {
             if (!canStepForward(me, planMode)) {
                 clearPlan();
@@ -228,13 +235,17 @@ public class OwnJavaStrategy extends Strategy
         if (plan.isEmpty()) {
             boolean planned = planToBestTarget();
             if (!planned) {
-                // Simple fallback: try to walk forward if possible, otherwise rotate.
+                // Fallback: walk forward if possible, otherwise rotate.
                 return canStepForward(me, PlanMode.SAFE) ? Move.STEP : Move.TURN_R;
             }
         }
 
         return plan.pollFirst();
     }
+
+    // =========================
+    // Planning modes
+    // =========================
 
     /**
      * Planning modes.
@@ -247,44 +258,67 @@ public class OwnJavaStrategy extends Strategy
      */
     private enum PlanMode { SAFE, RELAXED, ESCAPE }
 
+    /** High-level bait groups used for priorities. */
+    private enum Kind { GEM, LETTER, COFFEE, FOOD, OTHER, TRAP }
+
     /**
-     * Creates a plan to the "best" target based on reachable distance and a simple utility function.
+     * Creates a plan to the best target in a competitive way.
      *
      * <p>Fallback order:</p>
      * <ol>
-     *   <li>SAFE: avoid danger + avoid traps</li>
-     *   <li>RELAXED: ignore danger + avoid traps</li>
-     *   <li>ESCAPE: allow traps ONLY if stuck (no safe exit)</li>
+     *   <li>SAFE</li>
+     *   <li>RELAXED</li>
+     *   <li>ESCAPE (only if stuck)</li>
      * </ol>
      */
     private boolean planToBestTarget() {
+        // Hard-block: current occupied cells by others.
         Set<Long> occupied = currentOccupiedCellsByOthers();
 
-        // 1) SAFE
-        BfsResult safe = bfsFrom(me.getX(), me.getY(), true, false, occupied);
-        Bait safeTarget = chooseBestTarget(safe.dist);
-        safeTarget = maybeOpportunisticCoffeeFood(safeTarget, safe.dist);
+        // Optional: also block opponent front-cells (to reduce head-on teleports).
+        Set<Long> avoidCells = new HashSet<>(occupied);
+        if (AVOID_OPPONENT_FRONT_CELLS) {
+            avoidCells.addAll(predictedOpponentFrontCells());
+        }
 
-        if (safeTarget != null && buildPlanFromBfs(safe, safeTarget, PlanMode.SAFE)) {
+        // Precompute cheap step distances from me (grid BFS without direction) for gem range filter.
+        int[] stepDistFromMeSafe = bfsGridSteps(me.getX(), me.getY(), true, false, avoidCells);
+
+        // Precompute opponent tick distances (direction-aware BFS) once.
+        List<int[]> opponentsTickDists = computeOpponentTickDistances();
+
+        // 1) SAFE
+        BfsStateResult safe = bfsStateFrom(me.getX(), me.getY(), me.getViewDirection(), true, false, avoidCells);
+        ScoredTarget safeBest = chooseBestTargetCompetitive(safe, opponentsTickDists, stepDistFromMeSafe);
+        safeBest = maybeOpportunisticCoffeeFood(safeBest, safe, stepDistFromMeSafe);
+
+        if (safeBest != null && buildPlanFromStateBfs(safe, safeBest.bait, PlanMode.SAFE)) {
+            setCommitTarget(safeBest.bait);
             return true;
         }
 
         // 2) RELAXED (ignore learned danger)
-        BfsResult relaxed = bfsFrom(me.getX(), me.getY(), false, false, occupied);
-        Bait relaxedTarget = chooseBestTarget(relaxed.dist);
-        relaxedTarget = maybeOpportunisticCoffeeFood(relaxedTarget, relaxed.dist);
+        int[] stepDistFromMeRelaxed = bfsGridSteps(me.getX(), me.getY(), false, false, avoidCells);
+        BfsStateResult relaxed = bfsStateFrom(me.getX(), me.getY(), me.getViewDirection(), false, false, avoidCells);
+        ScoredTarget relaxedBest = chooseBestTargetCompetitive(relaxed, opponentsTickDists, stepDistFromMeRelaxed);
+        relaxedBest = maybeOpportunisticCoffeeFood(relaxedBest, relaxed, stepDistFromMeRelaxed);
 
-        if (relaxedTarget != null && buildPlanFromBfs(relaxed, relaxedTarget, PlanMode.RELAXED)) {
+        if (relaxedBest != null && buildPlanFromStateBfs(relaxed, relaxedBest.bait, PlanMode.RELAXED)) {
+            setCommitTarget(relaxedBest.bait);
             return true;
         }
 
-        // 3) ESCAPE: only if we have no safe exit (surrounded / blocked)
-        if (isStuck(occupied)) {
-            BfsResult escape = bfsFrom(me.getX(), me.getY(), false, true, occupied);
-            Bait escapeTarget = chooseBestTarget(escape.dist); // still never choose TRAP as a target
-            escapeTarget = maybeOpportunisticCoffeeFood(escapeTarget, escape.dist);
+        // 3) ESCAPE: only if we have no safe exit
+        if (isStuck(avoidCells)) {
+            // In ESCAPE mode we still avoid occupied cells (teleport risk), but we allow TRAP tiles.
+            BfsStateResult escape = bfsStateFrom(me.getX(), me.getY(), me.getViewDirection(), false, true, occupied);
+            int[] stepDistFromMeEscape = bfsGridSteps(me.getX(), me.getY(), false, true, occupied);
 
-            if (escapeTarget != null && buildPlanFromBfs(escape, escapeTarget, PlanMode.ESCAPE)) {
+            ScoredTarget escapeBest = chooseBestTargetCompetitive(escape, opponentsTickDists, stepDistFromMeEscape);
+            escapeBest = maybeOpportunisticCoffeeFood(escapeBest, escape, stepDistFromMeEscape);
+
+            if (escapeBest != null && buildPlanFromStateBfs(escape, escapeBest.bait, PlanMode.ESCAPE)) {
+                setCommitTarget(escapeBest.bait);
                 return true;
             }
         }
@@ -293,35 +327,20 @@ public class OwnJavaStrategy extends Strategy
     }
 
     /**
-     * Builds the move plan from a BFS result (parents array).
-     * Sets {@link #planMode} to match the policy used to create the plan.
+     * Stores a short commit window for the chosen target.
+     * This reduces oscillation when baits appear/vanish frequently.
      */
-    private boolean buildPlanFromBfs(BfsResult bfs, Bait target, PlanMode mode) {
-        int startIdx = idx(me.getX(), me.getY());
-        int goalIdx = idx(target.getX(), target.getY());
-
-        if (goalIdx < 0 || goalIdx >= bfs.dist.length) return false;
-        if (bfs.dist[goalIdx] < 0) return false;
-
-        List<Integer> path = reconstructPath(startIdx, goalIdx, bfs.parent);
-        if (path.isEmpty()) return false;
-
-        plan.clear();
-        appendMovesForPath(plan, path, me.getX(), me.getY(), me.getViewDirection());
-
-        if (!plan.isEmpty()) {
-            planMode = mode;
-            return true;
-        }
-
-        return false;
+    private void setCommitTarget(Bait bait) {
+        if (bait == null) return;
+        currentTargetKey = key(bait.getX(), bait.getY());
+        commitUntilTick = tick + TARGET_COMMIT_TICKS;
     }
 
     /**
-     * Returns {@code true} if the bot has no adjacent cell it can enter in SAFE mode.
-     * This is our "stuck" detection (e.g. surrounded by traps or remembered-danger zones).
+     * Returns true if the bot has no adjacent cell it can enter in SAFE mode.
+     * We use it to allow ESCAPE mode only when needed.
      */
-    private boolean isStuck(Set<Long> occupiedByOthers) {
+    private boolean isStuck(Set<Long> blocked) {
         int x = me.getX();
         int y = me.getY();
 
@@ -333,71 +352,81 @@ public class OwnJavaStrategy extends Strategy
         };
 
         for (int[] nb : nbs) {
-            if (isCellAllowed(nb[0], nb[1], true, false, occupiedByOthers)) {
+            if (isCellAllowed(nb[0], nb[1], true, false, blocked)) {
                 return false;
             }
         }
         return true;
     }
 
-    /** High-level bait groups used for priorities. */
-    private enum Kind { GEM, LETTER, COFFEE, FOOD, OTHER, TRAP }
+    // =========================
+    // Competitive scoring
+    // =========================
 
     /**
-     * Chooses the best target bait given a distance array.
-     *
-     * <p>Rules:</p>
-     * <ul>
-     *   <li>Never target TRAP.</li>
-     *   <li>Ignore unreachable cells ({@code dist < 0}).</li>
-     *   <li>Ignore gems beyond {@link #GEM_MAX_DISTANCE_STEPS}.</li>
-     *   <li>Use a simple utility score: class priority + bait score - distance penalty - danger penalty.</li>
-     * </ul>
+     * Small wrapper that keeps a bait and its computed utility score.
      */
-    private Bait chooseBestTarget(int[] dist) {
-        if (dist == null || dist.length == 0) return null;
+    private static final class ScoredTarget {
+        final Bait bait;
+        final long score;
 
-        Bait best = null;
-        long bestScore = Long.MIN_VALUE;
+        ScoredTarget(Bait bait, long score) {
+            this.bait = bait;
+            this.score = score;
+        }
+    }
 
-        for (Bait bait : baits.values()) {
-            Kind kind = classify(bait);
+    /**
+     * Picks the best bait using:
+     * <ul>
+     *   <li>my tick-accurate distance (BFS in (x,y,dir))</li>
+     *   <li>opponents tick distance estimate (who arrives first)</li>
+     *   <li>bait category priority</li>
+     *   <li>danger memory penalty</li>
+     * </ul>
+     *
+     * <p>Important: this function also applies target hysteresis (commit window).</p>
+     */
+    private ScoredTarget chooseBestTargetCompetitive(
+            BfsStateResult myBfs,
+            List<int[]> opponentsTickDists,
+            int[] myStepDistForGemFilter
+    ) {
+        if (myBfs == null || myBfs.dist == null) return null;
 
-            // Never go *for* a trap.
-            if (kind == Kind.TRAP) continue;
-
-            int bi = idx(bait.getX(), bait.getY());
-            if (bi < 0 || bi >= dist.length) continue;
-
-            int d = dist[bi];
-            if (d < 0) continue; // unreachable
-
-            // Limit GEM range
-            if (kind == Kind.GEM && d > GEM_MAX_DISTANCE_STEPS) {
-                continue;
+        // If commit is active and current target still exists, keep it unless a much better option appears.
+        ScoredTarget committed = null;
+        if (currentTargetKey != null && tick < commitUntilTick) {
+            Bait committedBait = baits.get(currentTargetKey);
+            if (committedBait != null && classify(committedBait) != Kind.TRAP) {
+                long committedScore = computeUtility(committedBait, myBfs, opponentsTickDists, myStepDistForGemFilter);
+                // Only keep if it's reachable.
+                if (committedScore > Long.MIN_VALUE / 2) {
+                    committed = new ScoredTarget(committedBait, committedScore);
+                }
+            } else {
+                currentTargetKey = null;
+                commitUntilTick = 0;
             }
+        }
 
-            // Penalize if the target cell is currently in danger memory
-            long dangerPenalty = isDanger(bait.getX(), bait.getY()) ? 1_000_000L : 0;
+        ScoredTarget best = committed;
+        for (Bait bait : baits.values()) {
+            if (bait == null) continue;
 
-            // Priority by type (adjust as you like)
-            long classBase = switch (kind) {
-                case GEM -> 3_000_000L;
-                case LETTER -> 2_000_000L;
-                case COFFEE -> 1_000_000L;
-                case FOOD -> 500_000L;
-                default -> 100_000L;
-            };
+            long util = computeUtility(bait, myBfs, opponentsTickDists, myStepDistForGemFilter);
+            if (util <= Long.MIN_VALUE / 2) continue;
 
-            // Simple utility
-            long util = classBase
-                    + ((long) bait.getScore()) * 1000L
-                    - (long) d * 10L
-                    - dangerPenalty;
+            if (best == null || util > best.score) {
+                best = new ScoredTarget(bait, util);
+            }
+        }
 
-            if (util > bestScore) {
-                bestScore = util;
-                best = bait;
+        // If commit is active and we found a different target, require a clear improvement.
+        if (committed != null && best != null && best.bait != committed.bait) {
+            long need = committed.score + (committed.score * SWITCH_IMPROVEMENT_PERCENT) / 100L;
+            if (best.score < need) {
+                return committed;
             }
         }
 
@@ -405,112 +434,370 @@ public class OwnJavaStrategy extends Strategy
     }
 
     /**
-     * Opportunistic detour:
-     * If we are currently targeting COFFEE or FOOD, and there is another COFFEE/FOOD reachable within
-     * {@link #OPPORTUNISTIC_RADIUS_STEPS} from the current position, we temporarily target the nearer one.
+     * Computes a utility score for a bait.
      *
-     * <p>This is a simple approximation of "on the way". It only checks the local neighborhood around the bot.</p>
+     * <p>Returns a very negative value for "invalid" targets (unreachable, trap, too far gem, etc.).</p>
      */
-    private Bait maybeOpportunisticCoffeeFood(@Nullable Bait currentTarget, int[] distFromMe) {
-        if (currentTarget == null || distFromMe == null) return currentTarget;
+    private long computeUtility(
+            Bait bait,
+            BfsStateResult myBfs,
+            List<int[]> opponentsTickDists,
+            int[] myStepDistForGemFilter
+    ) {
+        Kind kind = classify(bait);
+        if (kind == Kind.TRAP) return Long.MIN_VALUE;
 
-        Kind targetKind = classify(currentTarget);
+        // Reachability (my ticks)
+        int myTicks = minTicksToCell(myBfs.dist, bait.getX(), bait.getY());
+        if (myTicks < 0) return Long.MIN_VALUE;
+
+        // GEM range filter based on grid steps (cheap and stable)
+        if (kind == Kind.GEM && myStepDistForGemFilter != null) {
+            int bi = idx(bait.getX(), bait.getY());
+            int steps = (bi >= 0 && bi < myStepDistForGemFilter.length) ? myStepDistForGemFilter[bi] : -1;
+            if (steps < 0 || steps > GEM_MAX_DISTANCE_STEPS) {
+                return Long.MIN_VALUE;
+            }
+        }
+
+        // Opponent best tick distance
+        int oppTicks = minOpponentTicksToCell(opponentsTickDists, bait.getX(), bait.getY());
+
+        // Win probability (very simple discrete model)
+        int pWinScaled = winProbabilityScaled(myTicks, oppTicks); // 0..100
+
+        // Danger penalty (only if the target cell is remembered dangerous)
+        long dangerPenalty = isDanger(bait.getX(), bait.getY()) ? 1_000_000L : 0;
+
+        // Base priority by kind
+        long classBase = switch (kind) {
+            case GEM -> 3_000_000L;
+            case LETTER -> 2_000_000L;
+            case COFFEE -> 1_000_000L;
+            case FOOD -> 500_000L;
+            default -> 100_000L;
+        };
+
+        // Raw value for the bait
+        long rawValue = classBase + ((long) bait.getScore()) * 1000L;
+
+        // Expected value (scaled by P(win))
+        long expected = (rawValue * pWinScaled) / 100L;
+
+        // Tick cost penalty (planning uses real ticks)
+        long tickCost = (long) myTicks * 10L;
+
+        return expected - tickCost - dangerPenalty;
+    }
+
+    /**
+     * Returns a probability (0..100) to win the race for a bait.
+     *
+     * <p>Rules:</p>
+     * <ul>
+     *   <li>If no opponent can reach it: 100%</li>
+     *   <li>If we arrive strictly earlier: 100%</li>
+     *   <li>If we tie: 35% (ties often cause collision/teleport or the other gets it first)</li>
+     *   <li>If we arrive later: 0%</li>
+     * </ul>
+     */
+    private int winProbabilityScaled(int myTicks, int oppTicks) {
+        if (oppTicks < 0) return 100;
+        if (myTicks + 1 < oppTicks) return 100;
+        if (myTicks == oppTicks) return 35;
+        if (myTicks < oppTicks) return 60; // small edge
+        return 0;
+    }
+
+    /**
+     * Opportunistic detour:
+     * If the selected target is COFFEE or FOOD, check if another COFFEE/FOOD is very close,
+     * and temporarily take the closer one.
+     *
+     * <p>This is intentionally simple and local.</p>
+     */
+    private ScoredTarget maybeOpportunisticCoffeeFood(
+            @Nullable ScoredTarget current,
+            BfsStateResult myBfs,
+            int[] stepDistFromMe
+    ) {
+        if (current == null || current.bait == null) return current;
+
+        Kind targetKind = classify(current.bait);
         if (targetKind != Kind.COFFEE && targetKind != Kind.FOOD) {
-            return currentTarget;
+            return current;
         }
 
         Bait bestNear = null;
-        int bestDist = Integer.MAX_VALUE;
+        int bestSteps = Integer.MAX_VALUE;
         int bestScore = Integer.MIN_VALUE;
 
         for (Bait bait : baits.values()) {
-            if (bait == currentTarget) continue;
+            if (bait == null || bait == current.bait) continue;
 
             Kind k = classify(bait);
-            if (k != Kind.COFFEE && k != Kind.FOOD) continue; // only C/F
+            if (k != Kind.COFFEE && k != Kind.FOOD) continue;
 
             int bi = idx(bait.getX(), bait.getY());
-            if (bi < 0 || bi >= distFromMe.length) continue;
+            if (stepDistFromMe == null || bi < 0 || bi >= stepDistFromMe.length) continue;
 
-            int d = distFromMe[bi];
-            if (d <= 0) continue; // ignore current cell or unreachable
-            if (d > OPPORTUNISTIC_RADIUS_STEPS) continue;
+            int steps = stepDistFromMe[bi];
+            if (steps <= 0) continue;
+            if (steps > OPPORTUNISTIC_RADIUS_STEPS) continue;
 
-            // Prefer closer; tie-break with bait score
-            if (d < bestDist || (d == bestDist && bait.getScore() > bestScore)) {
-                bestDist = d;
+            if (steps < bestSteps || (steps == bestSteps && bait.getScore() > bestScore)) {
+                bestSteps = steps;
                 bestScore = bait.getScore();
                 bestNear = bait;
             }
         }
 
-        return (bestNear != null) ? bestNear : currentTarget;
+        if (bestNear == null) return current;
+
+        // Re-score the near target using the same logic (race-aware, tick-aware)
+        // Note: reuse computeUtility rather than guessing.
+        long nearUtil = computeUtility(bestNear, myBfs, computeOpponentTickDistances(), stepDistFromMe);
+        if (nearUtil <= Long.MIN_VALUE / 2) return current;
+
+        return new ScoredTarget(bestNear, nearUtil);
     }
 
-    /**
-     * Attempts to classify a bait. We try to read a type string if available;
-     * if not, we fall back to heuristics based on score.
-     */
-    private Kind classify(Bait bait) {
-        try {
-            Object type = bait.getType();
-            if (type != null) {
-                String t = type.toString().toUpperCase(Locale.ROOT);
-                if (t.contains("TRAP")) return Kind.TRAP;
-                if (t.contains("GEM")) return Kind.GEM;
-                if (t.contains("COFFEE")) return Kind.COFFEE;
-                if (t.contains("FOOD")) return Kind.FOOD;
-                if (t.contains("LETTER") || t.contains("CHAR")) return Kind.LETTER;
-            }
-        } catch (Exception ignored) {
-            // If Bait has no getType(), we just use fallback.
-        }
+    // =========================
+    // Direction-aware BFS (tick-accurate)
+    // =========================
 
-        // Fallback by score:
-        // - negative score -> trap
-        // - 0 -> letter
-        // - high score -> gem
-        int s = bait.getScore();
-        if (s < 0) return Kind.TRAP;
-        if (s == 0) return Kind.LETTER;
-        if (s >= 300) return Kind.GEM;
-        if (s >= 40) return Kind.COFFEE;
-        if (s > 0) return Kind.FOOD;
-        return Kind.OTHER;
-    }
     /**
-     * Result of a BFS run:
+     * Result of direction-aware BFS:
      * <ul>
-     *   <li>{@code dist[i]} = distance from start to cell i, or -1 if unreachable</li>
-     *   <li>{@code parent[i]} = previous cell on the shortest path (for reconstruction)</li>
+     *   <li>dist[state] = minimal ticks from start to this (x,y,dir)</li>
+     *   <li>parent[state] = previous state index</li>
+     *   <li>parentMove[state] = move used to enter this state</li>
      * </ul>
      */
-    private static final class BfsResult {
+    private static final class BfsStateResult {
         final int[] dist;
         final int[] parent;
+        final byte[] parentMove;
 
-        BfsResult(int[] dist, int[] parent) {
+        BfsStateResult(int[] dist, int[] parent, byte[] parentMove) {
             this.dist = dist;
             this.parent = parent;
+            this.parentMove = parentMove;
         }
     }
 
     /**
-     * Runs BFS from the given start cell.
+     * Runs BFS on the state graph (x,y,dir) with unit cost edges (each move costs 1 tick).
      *
-     * @param avoidDanger      if true, cells in {@link #dangerUntilTick} are treated as blocked.
-     * @param allowTrapCells   if true, trap bait cells are allowed (used only in ESCAPE mode).
-     * @param occupiedByOthers cells occupied by other players are treated as blocked.
+     * @param avoidDanger    if true, cells in danger memory are treated as blocked.
+     * @param allowTrapCells if true, trap bait cells are allowed (ESCAPE mode).
+     * @param blockedCells   cells treated as blocked (occupied by others, etc.). Can be null.
      */
-    private BfsResult bfsFrom(int startX, int startY, boolean avoidDanger, boolean allowTrapCells, Set<Long> occupiedByOthers) {
-        int n = width * height;
-        int[] dist = new int[n];
-        int[] parent = new int[n];
+    private BfsStateResult bfsStateFrom(
+            int startX,
+            int startY,
+            ViewDirection startDir,
+            boolean avoidDanger,
+            boolean allowTrapCells,
+            @Nullable Set<Long> blockedCells
+    ) {
+        int cellCount = width * height;
+        int stateCount = cellCount * 4;
+
+        int[] dist = new int[stateCount];
+        int[] parent = new int[stateCount];
+        byte[] parentMove = new byte[stateCount];
+
         Arrays.fill(dist, -1);
         Arrays.fill(parent, -1);
 
+        int startCell = idx(startX, startY);
+        int startDirOrd = dirToOrd(startDir);
+        if (startCell < 0 || startCell >= cellCount || startDirOrd < 0) {
+            return new BfsStateResult(dist, parent, parentMove);
+        }
+
+        int startState = stateIndex(startCell, startDirOrd);
+
+        int[] queue = new int[stateCount];
+        int head = 0, tail = 0;
+
+        dist[startState] = 0;
+        queue[tail++] = startState;
+
+        while (head < tail) {
+            int cur = queue[head++];
+            int curDist = dist[cur];
+
+            int curDir = cur / cellCount;
+            int curCell = cur - (curDir * cellCount);
+            int cx = curCell % width;
+            int cy = curCell / width;
+
+            // TURN_L
+            int leftDir = (curDir + 3) & 3;
+            int leftState = stateIndex(curCell, leftDir);
+            if (dist[leftState] == -1) {
+                dist[leftState] = curDist + 1;
+                parent[leftState] = cur;
+                parentMove[leftState] = moveToByte(Move.TURN_L);
+                queue[tail++] = leftState;
+            }
+
+            // TURN_R
+            int rightDir = (curDir + 1) & 3;
+            int rightState = stateIndex(curCell, rightDir);
+            if (dist[rightState] == -1) {
+                dist[rightState] = curDist + 1;
+                parent[rightState] = cur;
+                parentMove[rightState] = moveToByte(Move.TURN_R);
+                queue[tail++] = rightState;
+            }
+
+            // STEP
+            int[] front = frontCell(cx, cy, ordToDir(curDir));
+            if (front != null) {
+                int nx = front[0];
+                int ny = front[1];
+                if (isCellAllowed(nx, ny, avoidDanger, allowTrapCells, blockedCells)) {
+                    int nextCell = idx(nx, ny);
+                    int stepState = stateIndex(nextCell, curDir);
+                    if (dist[stepState] == -1) {
+                        dist[stepState] = curDist + 1;
+                        parent[stepState] = cur;
+                        parentMove[stepState] = moveToByte(Move.STEP);
+                        queue[tail++] = stepState;
+                    }
+                }
+            }
+        }
+
+        return new BfsStateResult(dist, parent, parentMove);
+    }
+
+    /**
+     * Builds the move plan by reconstructing moves from the state BFS parents.
+     * The goal is any direction on the bait cell (we pick the minimal tick one).
+     */
+    private boolean buildPlanFromStateBfs(BfsStateResult bfs, Bait target, PlanMode mode) {
+        int cellCount = width * height;
+        int goalCell = idx(target.getX(), target.getY());
+        if (goalCell < 0 || goalCell >= cellCount) return false;
+
+        int startCell = idx(me.getX(), me.getY());
+        int startDir = dirToOrd(me.getViewDirection());
+        int startState = stateIndex(startCell, startDir);
+
+        // Pick best goal state among all directions on the goal cell.
+        int bestGoalState = -1;
+        int bestDist = Integer.MAX_VALUE;
+        for (int d = 0; d < 4; d++) {
+            int s = stateIndex(goalCell, d);
+            int ds = bfs.dist[s];
+            if (ds >= 0 && ds < bestDist) {
+                bestDist = ds;
+                bestGoalState = s;
+            }
+        }
+        if (bestGoalState < 0) return false;
+
+        // Reconstruct moves (reverse), then reverse into plan.
+        ArrayDeque<Move> rev = new ArrayDeque<>();
+        int cur = bestGoalState;
+
+        while (cur != startState) {
+            int p = bfs.parent[cur];
+            if (p < 0) return false;
+            Move m = byteToMove(bfs.parentMove[cur]);
+            if (m == null) return false;
+            rev.addLast(m);
+            cur = p;
+        }
+
+        plan.clear();
+        while (!rev.isEmpty()) {
+            plan.addLast(rev.removeLast());
+        }
+
+        if (!plan.isEmpty()) {
+            planMode = mode;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Returns minimal ticks to reach a cell (x,y) from a direction-aware dist array.
+     * We take the best direction at that cell.
+     */
+    private int minTicksToCell(int[] distState, int x, int y) {
+        int cellCount = width * height;
+        int cell = idx(x, y);
+        if (cell < 0 || cell >= cellCount) return -1;
+
+        int best = Integer.MAX_VALUE;
+        for (int d = 0; d < 4; d++) {
+            int s = stateIndex(cell, d);
+            int v = distState[s];
+            if (v >= 0 && v < best) best = v;
+        }
+        return (best == Integer.MAX_VALUE) ? -1 : best;
+    }
+
+    /**
+     * Calculates the minimum opponent ticks to reach a cell (x,y).
+     */
+    private int minOpponentTicksToCell(List<int[]> oppDistStates, int x, int y) {
+        if (oppDistStates == null || oppDistStates.isEmpty()) return -1;
+
+        int best = Integer.MAX_VALUE;
+        for (int[] dist : oppDistStates) {
+            if (dist == null) continue;
+            int v = minTicksToCell(dist, x, y);
+            if (v >= 0 && v < best) best = v;
+        }
+        return (best == Integer.MAX_VALUE) ? -1 : best;
+    }
+
+    /**
+     * Computes direction-aware distance arrays for each opponent (not including myself).
+     *
+     * <p>We assume opponents avoid traps and do not use our danger memory.</p>
+     */
+    private List<int[]> computeOpponentTickDistances() {
+        if (myPlayerId == null || me == null) return List.of();
+
+        List<int[]> res = new ArrayList<>();
+        for (PlayerSnapshot p : players.values()) {
+            if (p == null) continue;
+            if (p.getId() == myPlayerId) continue;
+
+            // Quick sanity
+            if (isOutOfBounds(p.getX(), p.getY())) continue;
+            if (!walkable[idx(p.getX(), p.getY())]) continue;
+
+            BfsStateResult bfs = bfsStateFrom(p.getX(), p.getY(), p.getViewDirection(),
+                    false, false, null);
+            res.add(bfs.dist);
+        }
+        return res;
+    }
+
+    // =========================
+    // Cheap grid BFS (steps only) - used for gem range filter
+    // =========================
+
+    /**
+     * Grid BFS that counts only steps (ignores direction and turn ticks).
+     * Useful for cheap range filters (like ignoring far gems).
+     */
+    private int[] bfsGridSteps(int startX, int startY, boolean avoidDanger, boolean allowTrapCells, @Nullable Set<Long> blockedCells) {
+        int n = width * height;
+        int[] dist = new int[n];
+        Arrays.fill(dist, -1);
+
         int start = idx(startX, startY);
-        if (start < 0 || start >= n) return new BfsResult(dist, parent);
+        if (start < 0 || start >= n) return dist;
 
         int[] queue = new int[n];
         int head = 0, tail = 0;
@@ -529,186 +816,47 @@ public class OwnJavaStrategy extends Strategy
             for (int i = 0; i < 4; i++) {
                 int nx = cx + dx[i];
                 int ny = cy + dy[i];
-
                 if (isOutOfBounds(nx, ny)) continue;
 
                 int ni = idx(nx, ny);
                 if (dist[ni] != -1) continue;
 
-                if (!isCellAllowed(nx, ny, avoidDanger, allowTrapCells, occupiedByOthers)) continue;
+                if (!isCellAllowed(nx, ny, avoidDanger, allowTrapCells, blockedCells)) continue;
 
                 dist[ni] = dist[cur] + 1;
-                parent[ni] = cur;
                 queue[tail++] = ni;
             }
         }
 
-        return new BfsResult(dist, parent);
+        return dist;
     }
+
+    // =========================
+    // Movement validation and collision avoidance
+    // =========================
 
     /**
-     * Checks if the bot is allowed to enter a specific cell under the given policy.
-     */
-    private boolean isCellAllowed(int x, int y, boolean avoidDanger, boolean allowTrapCells, Set<Long> occupiedByOthers) {
-        if (isOutOfBounds(x, y)) return false;
-
-        int i = idx(x, y);
-        if (!walkable[i]) return false;
-
-        // TRAP handling (dynamic)
-        Bait b = baits.get(key(x, y));
-        if (!allowTrapCells && b != null && classify(b) == Kind.TRAP) {
-            return false;
-        }
-
-        // Avoid other players
-        if (occupiedByOthers != null && occupiedByOthers.contains(key(x, y))) return false;
-
-        // Avoid learned danger zones in SAFE mode
-        if (avoidDanger && isDanger(x, y)) return false;
-
-        return true;
-    }
-
-    /**
-     * Reconstructs a path from start->goal using the BFS parent array.
-     * Returns a list of cell indices excluding the start cell (so the first entry is the next cell to enter).
-     */
-    private List<Integer> reconstructPath(int startIdx, int goalIdx, int[] parent) {
-        List<Integer> rev = new ArrayList<>();
-        int cur = goalIdx;
-
-        while (cur != -1 && cur != startIdx) {
-            rev.add(cur);
-            cur = parent[cur];
-        }
-
-        if (cur != startIdx) return List.of(); // no path
-        Collections.reverse(rev);
-        return rev;
-    }
-
-    /**
-     * Converts a path of cell indices into a sequence of moves (turns + steps),
-     * starting from the current position and view direction.
-     */
-    private void appendMovesForPath(Deque<Move> out, List<Integer> path, int startX, int startY, ViewDirection startDir) {
-        int cx = startX;
-        int cy = startY;
-        ViewDirection dir = startDir;
-
-        for (int cellIdx : path) {
-            int nx = cellIdx % width;
-            int ny = cellIdx / width;
-
-            int dx = nx - cx;
-            int dy = ny - cy;
-
-            ViewDirection desired = directionFromDelta(dx, dy);
-            if (desired == null) {
-                out.clear();
-                return;
-            }
-
-            // Turn as little as possible to face the desired direction
-            List<Move> turns = minimalTurns(dir, desired);
-            for (Move m : turns) {
-                out.addLast(m);
-                dir = applyTurn(dir, m);
-            }
-
-            out.addLast(Move.STEP);
-
-            cx = nx;
-            cy = ny;
-        }
-    }
-
-    private ViewDirection applyTurn(ViewDirection d, Move m) {
-        if (m == Move.TURN_R) return d.turnRight();
-        if (m == Move.TURN_L) return d.turnLeft();
-        return d;
-    }
-
-    /**
-     * Returns the minimal set of turns from one direction to another.
-     * Uses either N right turns or N left turns, whichever is smaller.
-     */
-    private List<Move> minimalTurns(ViewDirection from, ViewDirection to) {
-        int right = 0;
-        ViewDirection d = from;
-        while (!d.equals(to) && right < 4) {
-            d = d.turnRight();
-            right++;
-        }
-
-        int left = 0;
-        d = from;
-        while (!d.equals(to) && left < 4) {
-            d = d.turnLeft();
-            left++;
-        }
-
-        if (right <= left) {
-            List<Move> res = new ArrayList<>(right);
-            for (int i = 0; i < right; i++) res.add(Move.TURN_R);
-            return res;
-        } else {
-            List<Move> res = new ArrayList<>(left);
-            for (int i = 0; i < left; i++) res.add(Move.TURN_L);
-            return res;
-        }
-    }
-
-    /**
-     * Converts a (dx,dy) delta into a cardinal direction.
-     */
-    private ViewDirection directionFromDelta(int dx, int dy) {
-        if (dx == 1 && dy == 0) return ViewDirection.EAST;
-        if (dx == -1 && dy == 0) return ViewDirection.WEST;
-        if (dx == 0 && dy == 1) return ViewDirection.SOUTH;
-        if (dx == 0 && dy == -1) return ViewDirection.NORTH;
-        return null;
-    }
-    /**
-     * Checks whether a STEP forward is possible under the same policy that created the current plan.
-     * This prevents the bot from discarding ESCAPE plans (which may need to step on a TRAP).
+     * Checks whether a STEP forward is possible under the same policy used to create the current plan.
+     * This prevents discarding ESCAPE plans (which may require stepping onto a TRAP).
      */
     private boolean canStepForward(PlayerSnapshot snap, PlanMode mode) {
         int[] front = frontCell(snap.getX(), snap.getY(), snap.getViewDirection());
         if (front == null) return false;
 
         Set<Long> occupied = currentOccupiedCellsByOthers();
+        Set<Long> blocked = new HashSet<>(occupied);
+        if (AVOID_OPPONENT_FRONT_CELLS && mode != PlanMode.ESCAPE) {
+            blocked.addAll(predictedOpponentFrontCells());
+        }
 
         boolean avoidDanger = (mode == PlanMode.SAFE);
         boolean allowTrapCells = (mode == PlanMode.ESCAPE);
 
-        return isCellAllowed(front[0], front[1], avoidDanger, allowTrapCells, occupied);
+        return isCellAllowed(front[0], front[1], avoidDanger, allowTrapCells, blocked);
     }
 
     /**
-     * Returns the coordinates of the cell in front of (x,y) in the given direction,
-     * or {@code null} if that cell is outside the maze.
-     */
-    private int[] frontCell(int x, int y, ViewDirection dir) {
-        int dx = 0, dy = 0;
-
-        if (dir == ViewDirection.NORTH) dy = -1;
-        else if (dir == ViewDirection.SOUTH) dy = 1;
-        else if (dir == ViewDirection.EAST) dx = 1;
-        else if (dir == ViewDirection.WEST) dx = -1;
-        else return null;
-
-        int nx = x + dx;
-        int ny = y + dy;
-
-        if (isOutOfBounds(nx, ny)) return null;
-        return new int[]{nx, ny};
-    }
-
-    /**
-     * Returns a set of cells currently occupied by other players (not including myself).
-     * We treat these as blocked to reduce collisions.
+     * Returns cells currently occupied by other players (not including myself).
      */
     private Set<Long> currentOccupiedCellsByOthers() {
         if (myPlayerId == null) return Set.of();
@@ -722,8 +870,95 @@ public class OwnJavaStrategy extends Strategy
     }
 
     /**
+     * Returns a set of "front cells" of opponents (one cell ahead of their view direction).
+     * This is a small prediction to reduce head-on collisions.
+     */
+    private Set<Long> predictedOpponentFrontCells() {
+        if (myPlayerId == null) return Set.of();
+        Set<Long> res = new HashSet<>();
+
+        for (PlayerSnapshot p : players.values()) {
+            if (p == null) continue;
+            if (p.getId() == myPlayerId) continue;
+
+            int[] f = frontCell(p.getX(), p.getY(), p.getViewDirection());
+            if (f == null) continue;
+
+            // Only add if it is a valid walkable cell (otherwise irrelevant).
+            if (!isOutOfBounds(f[0], f[1]) && walkable[idx(f[0], f[1])]) {
+                res.add(key(f[0], f[1]));
+            }
+        }
+        return res;
+    }
+
+    // =========================
+    // Cell rules
+    // =========================
+
+    /**
+     * Checks if the bot is allowed to enter a specific cell under the given policy.
+     */
+    private boolean isCellAllowed(int x, int y, boolean avoidDanger, boolean allowTrapCells, @Nullable Set<Long> blockedCells) {
+        if (isOutOfBounds(x, y)) return false;
+
+        int i = idx(x, y);
+        if (!walkable[i]) return false;
+
+        // TRAP handling (dynamic)
+        Bait b = baits.get(key(x, y));
+        if (!allowTrapCells && b != null && classify(b) == Kind.TRAP) {
+            return false;
+        }
+
+        // Avoid players (and predicted front cells if provided)
+        if (blockedCells != null && blockedCells.contains(key(x, y))) return false;
+
+        // Avoid learned danger zones in SAFE mode
+        if (avoidDanger && isDanger(x, y)) return false;
+
+        return true;
+    }
+
+    /**
+     * Attempts to classify a bait.
+     * We try to read a type string if available; otherwise we fall back to score heuristics.
+     */
+    private Kind classify(Bait bait) {
+        try {
+            Object type = bait.getType();
+            if (type != null) {
+                String t = type.toString().toUpperCase(Locale.ROOT);
+                if (t.contains("TRAP")) return Kind.TRAP;
+                if (t.contains("GEM")) return Kind.GEM;
+                if (t.contains("COFFEE")) return Kind.COFFEE;
+                if (t.contains("FOOD")) return Kind.FOOD;
+                if (t.contains("LETTER") || t.contains("CHAR")) return Kind.LETTER;
+            }
+        } catch (Exception ignored) {
+            // Some versions might not have getType(). Then we fall back to score.
+        }
+
+        // Fallback by score (common patterns):
+        // - negative score -> trap
+        // - 0 -> letter
+        // - very high score -> gem
+        int s = bait.getScore();
+        if (s < 0) return Kind.TRAP;
+        if (s == 0) return Kind.LETTER;
+        if (s >= 300) return Kind.GEM;
+        if (s >= 40) return Kind.COFFEE;
+        if (s > 0) return Kind.FOOD;
+        return Kind.OTHER;
+    }
+
+    // =========================
+    // Danger memory
+    // =========================
+
+    /**
      * Marks a cell as dangerous for {@link #DANGER_TTL_TICKS} ticks.
-     * We only use this after we got teleported by a trap.
+     * Used after we get teleported by a trap.
      */
     private void markDanger(int x, int y) {
         if (isOutOfBounds(x, y)) return;
@@ -749,6 +984,30 @@ public class OwnJavaStrategy extends Strategy
         planMode = PlanMode.SAFE;
     }
 
+    // =========================
+    // Direction helpers + indexing
+    // =========================
+
+    /**
+     * Returns the coordinates of the cell in front of (x,y) in the given direction,
+     * or null if that cell is outside the maze.
+     */
+    private int[] frontCell(int x, int y, ViewDirection dir) {
+        int dx = 0, dy = 0;
+
+        if (dir == ViewDirection.NORTH) dy = -1;
+        else if (dir == ViewDirection.SOUTH) dy = 1;
+        else if (dir == ViewDirection.EAST) dx = 1;
+        else if (dir == ViewDirection.WEST) dx = -1;
+        else return null;
+
+        int nx = x + dx;
+        int ny = y + dy;
+
+        if (isOutOfBounds(nx, ny)) return null;
+        return new int[]{nx, ny};
+    }
+
     /**
      * @return true if the (x,y) coordinates are outside the maze bounds.
      */
@@ -769,5 +1028,58 @@ public class OwnJavaStrategy extends Strategy
      */
     private long key(int x, int y) {
         return (((long) x) << 32) ^ (y & 0xffffffffL);
+    }
+
+    /**
+     * Converts a ViewDirection into a small ordinal (0..3).
+     * We use: 0=N, 1=E, 2=S, 3=W.
+     */
+    private int dirToOrd(ViewDirection d) {
+        if (d == ViewDirection.NORTH) return 0;
+        if (d == ViewDirection.EAST) return 1;
+        if (d == ViewDirection.SOUTH) return 2;
+        if (d == ViewDirection.WEST) return 3;
+        return -1;
+    }
+
+    /**
+     * Converts an ordinal (0..3) back to ViewDirection.
+     */
+    private ViewDirection ordToDir(int ord) {
+        return switch (ord & 3) {
+            case 0 -> ViewDirection.NORTH;
+            case 1 -> ViewDirection.EAST;
+            case 2 -> ViewDirection.SOUTH;
+            default -> ViewDirection.WEST;
+        };
+    }
+
+    /**
+     * Encodes a (cellIndex, dirOrd) into a state index.
+     */
+    private int stateIndex(int cellIdx, int dirOrd) {
+        return dirOrd * (width * height) + cellIdx;
+    }
+
+    /**
+     * Encodes a Move into a small byte to store it in arrays.
+     */
+    private byte moveToByte(Move m) {
+        if (m == Move.TURN_L) return 1;
+        if (m == Move.TURN_R) return 2;
+        if (m == Move.STEP) return 3;
+        return 0;
+    }
+
+    /**
+     * Decodes a stored byte back to a Move.
+     */
+    private Move byteToMove(byte b) {
+        return switch (b) {
+            case 1 -> Move.TURN_L;
+            case 2 -> Move.TURN_R;
+            case 3 -> Move.STEP;
+            default -> null;
+        };
     }
 }
