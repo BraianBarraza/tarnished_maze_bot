@@ -43,3 +43,6 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+/java-bots/src/main/java/de/dreamcube/mazegame/client/maze/strategy/tarnished/botDocumentation.md
+/java-bots/src/main/java/de/dreamcube/mazegame/client/maze/strategy/tarnished/proceso.md
+/java-bots/src/main/java/de/dreamcube/mazegame/client/maze/strategy/tarnished/projectInfo.md
