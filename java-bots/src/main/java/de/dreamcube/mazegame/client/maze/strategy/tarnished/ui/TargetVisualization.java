@@ -11,10 +11,13 @@ import java.awt.Point;
 import java.util.List;
 
 /**
- * Draws a marker for the current target bait.
+ * Draws a marker for the current target bait and (optionally) the planned path.
  * The marker respects maze offset and zoom.
  */
-public class TargetVisualization extends VisualizationComponent {
+public final class TargetVisualization extends VisualizationComponent {
+
+    private static final Color MARKER_COLOR = new Color(255, 0, 0, 200);
+    private static final Color PATH_COLOR = new Color(255, 0, 0, 120);
 
     private final WorldState worldState;
 
@@ -30,7 +33,7 @@ public class TargetVisualization extends VisualizationComponent {
             return;
         }
 
-        Bait currentTarget = worldState.currentTarget;
+        Bait currentTarget = worldState.getCurrentTarget();
         if (currentTarget == null) {
             return;
         }
@@ -42,24 +45,28 @@ public class TargetVisualization extends VisualizationComponent {
 
         Graphics2D graphics2D = (Graphics2D) graphics;
         drawPath(graphics2D, offset, cellPixelSize);
-        graphics2D.setColor(Color.RED);
+
+        graphics2D.setColor(MARKER_COLOR);
         graphics2D.drawOval(pixelX, pixelY, cellPixelSize, cellPixelSize);
     }
 
     private void drawPath(Graphics2D graphics2D, Point offset, int cellPixelSize) {
-        List<int[]> pathCells = worldState.currentPathCells;
-        if (pathCells == null || pathCells.size() < 2) {
+        List<Point> path = worldState.getCurrentPath();
+        if (path == null || path.size() < 2) {
             return;
         }
-        graphics2D.setColor(new Color(255, 0, 0, 140));
+
+        graphics2D.setColor(PATH_COLOR);
         int halfCell = cellPixelSize / 2;
-        int[] firstCell = pathCells.get(0);
-        int lastPixelX = offset.x + firstCell[0] * cellPixelSize + halfCell;
-        int lastPixelY = offset.y + firstCell[1] * cellPixelSize + halfCell;
-        for (int i = 1; i < pathCells.size(); i++) {
-            int[] cell = pathCells.get(i);
-            int pixelX = offset.x + cell[0] * cellPixelSize + halfCell;
-            int pixelY = offset.y + cell[1] * cellPixelSize + halfCell;
+
+        Point first = path.getFirst();
+        int lastPixelX = offset.x + first.x * cellPixelSize + halfCell;
+        int lastPixelY = offset.y + first.y * cellPixelSize + halfCell;
+
+        for (int i = 1; i < path.size(); i++) {
+            Point cell = path.get(i);
+            int pixelX = offset.x + cell.x * cellPixelSize + halfCell;
+            int pixelY = offset.y + cell.y * cellPixelSize + halfCell;
             graphics2D.drawLine(lastPixelX, lastPixelY, pixelX, pixelY);
             lastPixelX = pixelX;
             lastPixelY = pixelY;

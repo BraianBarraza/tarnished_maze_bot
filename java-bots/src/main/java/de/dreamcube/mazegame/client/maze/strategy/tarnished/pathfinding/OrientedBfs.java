@@ -4,43 +4,51 @@ import de.dreamcube.mazegame.client.maze.strategy.Move;
 import de.dreamcube.mazegame.client.maze.strategy.tarnished.model.MazeModel;
 import de.dreamcube.mazegame.common.maze.ViewDirection;
 
+import java.awt.Point;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 
 /**
- * Performs oriented BFS over (x,y,direction) states.
- * Each action (TURN_L, TURN_R, STEP) has cost 1 tick.
+ * Performs oriented BFS over (x, y, direction) states.
+ *
+ * <p>Each action ({@link Move#TURN_L}, {@link Move#TURN_R}, {@link Move#STEP}) costs exactly 1 tick.
+ * This means a standard BFS finds the shortest sequence of actions.</p>
  */
-public class OrientedBfs {
+public final class OrientedBfs {
+
+    private static final int DIRECTION_COUNT = 4;
+    private static final ViewDirection[] DIRECTIONS_BY_INDEX = {
+            ViewDirection.NORTH, ViewDirection.EAST, ViewDirection.SOUTH, ViewDirection.WEST
+    };
 
     private final MazeModel mazeModel;
 
     private int mazeWidth;
     private int mazeHeight;
+
     private int[] distanceByStateIndex;
     private Move[] firstMoveByStateIndex;
     private int[] previousStateIndexByState;
-
-    private static final ViewDirection[] DIRECTIONS_BY_INDEX = ViewDirection.values();
 
     public OrientedBfs(MazeModel mazeModel) {
         this.mazeModel = mazeModel;
     }
 
     /**
-     * Returns the minimum oriented distance to a target cell, across all directions.
+     * Returns the minimum oriented distance (in ticks) to a target cell, across all directions.
      */
     public int distanceTo(int targetX, int targetY) {
-        if (!isWithinMazeBounds(targetX, targetY) || distanceByStateIndex == null) {
+        if (isReady() || isWithinMazeBounds(targetX, targetY)) {
             return Integer.MAX_VALUE;
         }
-        int baseStateIndex = ((targetY * mazeWidth) + targetX) * 4;
+
+        int baseStateIndex = ((targetY * mazeWidth) + targetX) * DIRECTION_COUNT;
         int bestDistance = Integer.MAX_VALUE;
-        for (int directionIndex = 0; directionIndex < 4; directionIndex++) {
-            int candidateDistance = distanceByStateIndex[baseStateIndex + directionIndex];
-            if (candidateDistance < bestDistance) {
-                bestDistance = candidateDistance;
-            }
+        for (int directionIndex = 0; directionIndex < DIRECTION_COUNT; directionIndex++) {
+            bestDistance = Math.min(bestDistance, distanceByStateIndex[baseStateIndex + directionIndex]);
         }
         return bestDistance;
     }
@@ -49,13 +57,14 @@ public class OrientedBfs {
      * Returns the first move of a shortest path to the target cell.
      */
     public Move firstMoveTo(int targetX, int targetY) {
-        if (!isWithinMazeBounds(targetX, targetY) || firstMoveByStateIndex == null || distanceByStateIndex == null) {
+        if (isReady() || isWithinMazeBounds(targetX, targetY)) {
             return Move.DO_NOTHING;
         }
-        int baseStateIndex = ((targetY * mazeWidth) + targetX) * 4;
+
+        int baseStateIndex = ((targetY * mazeWidth) + targetX) * DIRECTION_COUNT;
         int bestDistance = Integer.MAX_VALUE;
         Move bestMove = Move.DO_NOTHING;
-        for (int directionIndex = 0; directionIndex < 4; directionIndex++) {
+        for (int directionIndex = 0; directionIndex < DIRECTION_COUNT; directionIndex++) {
             int candidateDistance = distanceByStateIndex[baseStateIndex + directionIndex];
             if (candidateDistance < bestDistance) {
                 bestDistance = candidateDistance;
@@ -74,21 +83,21 @@ public class OrientedBfs {
 
     /**
      * Computes oriented BFS distances and first moves from a starting state.
-     * If blockedCells is provided, true cells are treated as non-walkable.
+     *
+     * @param blockedCells if provided, cells with true are treated as non-walkable.
      */
     public void computeFrom(int startX, int startY, ViewDirection startDirection, boolean[][] blockedCells) {
-        mazeWidth = mazeModel.width;
-        mazeHeight = mazeModel.height;
+        mazeWidth = mazeModel.getWidth();
+        mazeHeight = mazeModel.getHeight();
 
-        int totalStateCount = mazeWidth * mazeHeight * 4;
-        distanceByStateIndex = new int[totalStateCount];
-        firstMoveByStateIndex = new Move[totalStateCount];
-        previousStateIndexByState = new int[totalStateCount];
+        int totalStateCount = mazeWidth * mazeHeight * DIRECTION_COUNT;
+        ensureCapacity(totalStateCount);
+
         Arrays.fill(distanceByStateIndex, Integer.MAX_VALUE);
         Arrays.fill(firstMoveByStateIndex, Move.DO_NOTHING);
         Arrays.fill(previousStateIndexByState, -1);
 
-        if (!isWithinMazeBounds(startX, startY) || mazeModel.walkable == null || !mazeModel.walkable[startX][startY]) {
+        if (!mazeModel.isWalkable(startX, startY)) {
             return;
         }
 
@@ -101,8 +110,8 @@ public class OrientedBfs {
         while (!queue.isEmpty()) {
             int currentStateIndex = queue.removeFirst();
 
-            int cellIndex = currentStateIndex / 4;
-            int directionIndex = currentStateIndex % 4;
+            int cellIndex = currentStateIndex / DIRECTION_COUNT;
+            int directionIndex = currentStateIndex % DIRECTION_COUNT;
             int x = cellIndex % mazeWidth;
             int y = cellIndex / mazeWidth;
 
@@ -111,19 +120,15 @@ public class OrientedBfs {
             ViewDirection currentDirection = DIRECTIONS_BY_INDEX[directionIndex];
 
             // TURN_L
-            ViewDirection leftDirection = turnLeft(currentDirection);
-            relaxNeighbor(queue, currentStateIndex, x, y, directionToIndex(leftDirection), nextDistance, inheritedFirstMove, Move.TURN_L);
+            relaxNeighbor(queue, currentStateIndex, x, y, directionToIndex(turnLeft(currentDirection)), nextDistance, inheritedFirstMove, Move.TURN_L);
 
             // TURN_R
-            ViewDirection rightDirection = turnRight(currentDirection);
-            relaxNeighbor(queue, currentStateIndex, x, y, directionToIndex(rightDirection), nextDistance, inheritedFirstMove, Move.TURN_R);
+            relaxNeighbor(queue, currentStateIndex, x, y, directionToIndex(turnRight(currentDirection)), nextDistance, inheritedFirstMove, Move.TURN_R);
 
             // STEP
             int nextX = x + stepDeltaX(currentDirection);
             int nextY = y + stepDeltaY(currentDirection);
-            if (isWithinMazeBounds(nextX, nextY)
-                    && mazeModel.walkable[nextX][nextY]
-                    && !isBlocked(blockedCells, nextX, nextY)) {
+            if (mazeModel.isWalkable(nextX, nextY) && !isBlocked(blockedCells, nextX, nextY)) {
                 int stepStateIndex = toStateIndex(nextX, nextY, directionIndex);
                 if (distanceByStateIndex[stepStateIndex] == Integer.MAX_VALUE) {
                     distanceByStateIndex[stepStateIndex] = nextDistance;
@@ -134,6 +139,64 @@ public class OrientedBfs {
                 }
             }
         }
+    }
+
+    /**
+     * Returns a list of maze cells on the shortest path to the target.
+     * If unreachable, returns an empty list.
+     */
+    public List<Point> getPathTo(int targetX, int targetY) {
+        if (isReady() || isWithinMazeBounds(targetX, targetY)) {
+            return List.of();
+        }
+
+        int baseStateIndex = ((targetY * mazeWidth) + targetX) * DIRECTION_COUNT;
+        int bestDistance = Integer.MAX_VALUE;
+        int bestStateIndex = -1;
+        for (int directionIndex = 0; directionIndex < DIRECTION_COUNT; directionIndex++) {
+            int candidateDistance = distanceByStateIndex[baseStateIndex + directionIndex];
+            if (candidateDistance < bestDistance) {
+                bestDistance = candidateDistance;
+                bestStateIndex = baseStateIndex + directionIndex;
+            }
+        }
+        if (bestStateIndex == -1 || bestDistance == Integer.MAX_VALUE) {
+            return List.of();
+        }
+
+        ArrayList<Point> reversedCells = new ArrayList<>();
+        int currentStateIndex = bestStateIndex;
+        int lastCellX = Integer.MIN_VALUE;
+        int lastCellY = Integer.MIN_VALUE;
+        while (currentStateIndex >= 0) {
+            int cellIndex = currentStateIndex / DIRECTION_COUNT;
+            int cellX = cellIndex % mazeWidth;
+            int cellY = cellIndex / mazeWidth;
+
+            if (cellX != lastCellX || cellY != lastCellY) {
+                reversedCells.add(new Point(cellX, cellY));
+                lastCellX = cellX;
+                lastCellY = cellY;
+            }
+
+            currentStateIndex = previousStateIndexByState[currentStateIndex];
+        }
+
+        Collections.reverse(reversedCells);
+        return reversedCells;
+    }
+
+    private boolean isReady() {
+        return distanceByStateIndex == null || firstMoveByStateIndex == null || previousStateIndexByState == null;
+    }
+
+    private void ensureCapacity(int totalStateCount) {
+        if (distanceByStateIndex != null && distanceByStateIndex.length == totalStateCount) {
+            return;
+        }
+        distanceByStateIndex = new int[totalStateCount];
+        firstMoveByStateIndex = new Move[totalStateCount];
+        previousStateIndexByState = new int[totalStateCount];
     }
 
     private void relaxNeighbor(
@@ -150,6 +213,7 @@ public class OrientedBfs {
         if (distanceByStateIndex[neighborStateIndex] != Integer.MAX_VALUE) {
             return;
         }
+
         distanceByStateIndex[neighborStateIndex] = nextDistance;
         firstMoveByStateIndex[neighborStateIndex] =
                 distanceByStateIndex[currentStateIndex] == 0 ? turnMove : inheritedFirstMove;
@@ -157,58 +221,16 @@ public class OrientedBfs {
         queue.add(neighborStateIndex);
     }
 
-    /**
-     * Returns a list of maze cells on the shortest path to the target.
-     * Each entry is an int array: [x, y]. If unreachable, returns an empty list.
-     */
-    public java.util.List<int[]> getPathCellsTo(int targetX, int targetY) {
-        if (!isWithinMazeBounds(targetX, targetY) || distanceByStateIndex == null || previousStateIndexByState == null) {
-            return java.util.List.of();
-        }
-        int baseStateIndex = ((targetY * mazeWidth) + targetX) * 4;
-        int bestDistance = Integer.MAX_VALUE;
-        int bestStateIndex = -1;
-        for (int directionIndex = 0; directionIndex < 4; directionIndex++) {
-            int candidateDistance = distanceByStateIndex[baseStateIndex + directionIndex];
-            if (candidateDistance < bestDistance) {
-                bestDistance = candidateDistance;
-                bestStateIndex = baseStateIndex + directionIndex;
-            }
-        }
-        if (bestStateIndex == -1 || bestDistance == Integer.MAX_VALUE) {
-            return java.util.List.of();
-        }
-
-        java.util.ArrayList<int[]> reversedCells = new java.util.ArrayList<>();
-        int currentStateIndex = bestStateIndex;
-        int lastCellX = Integer.MIN_VALUE;
-        int lastCellY = Integer.MIN_VALUE;
-        while (currentStateIndex >= 0) {
-            int cellIndex = currentStateIndex / 4;
-            int cellX = cellIndex % mazeWidth;
-            int cellY = cellIndex / mazeWidth;
-            if (cellX != lastCellX || cellY != lastCellY) {
-                reversedCells.add(new int[]{cellX, cellY});
-                lastCellX = cellX;
-                lastCellY = cellY;
-            }
-            currentStateIndex = previousStateIndexByState[currentStateIndex];
-        }
-
-        java.util.Collections.reverse(reversedCells);
-        return reversedCells;
-    }
-
     private int toStateIndex(int x, int y, int directionIndex) {
-        return ((y * mazeWidth) + x) * 4 + directionIndex;
+        return ((y * mazeWidth) + x) * DIRECTION_COUNT + directionIndex;
     }
 
     private boolean isWithinMazeBounds(int x, int y) {
-        return x >= 0 && y >= 0 && x < mazeWidth && y < mazeHeight;
+        return x < 0 || y < 0 || x >= mazeWidth || y >= mazeHeight;
     }
 
     private int directionToIndex(ViewDirection direction) {
-        // Keeps the code robust even if the enum order changes.
+        // Robust mapping even if enum order changes.
         return switch (direction) {
             case NORTH -> 0;
             case EAST -> 1;
@@ -237,9 +259,8 @@ public class OrientedBfs {
 
     private int stepDeltaX(ViewDirection direction) {
         return switch (direction) {
-            case NORTH -> 0;
+            case NORTH, SOUTH -> 0;
             case EAST -> 1;
-            case SOUTH -> 0;
             case WEST -> -1;
         };
     }
@@ -247,13 +268,16 @@ public class OrientedBfs {
     private int stepDeltaY(ViewDirection direction) {
         return switch (direction) {
             case NORTH -> -1;
-            case EAST -> 0;
+            case EAST, WEST -> 0;
             case SOUTH -> 1;
-            case WEST -> 0;
         };
     }
 
     private boolean isBlocked(boolean[][] blockedCells, int x, int y) {
-        return blockedCells != null && blockedCells[x][y];
+        return blockedCells != null
+                && x >= 0 && y >= 0
+                && x < blockedCells.length
+                && y < blockedCells[x].length
+                && blockedCells[x][y];
     }
 }

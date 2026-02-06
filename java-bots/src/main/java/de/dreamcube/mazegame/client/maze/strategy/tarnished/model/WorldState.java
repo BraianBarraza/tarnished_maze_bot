@@ -1,41 +1,68 @@
 package de.dreamcube.mazegame.client.maze.strategy.tarnished.model;
 
 import de.dreamcube.mazegame.client.maze.Bait;
+import lombok.Getter;
+import lombok.Setter;
 
-import java.util.ArrayList;
+import java.awt.Point;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * Holds dynamic game state (baits, target, pause flag).
+ * Holds dynamic bot state that is shared between strategy, control panel and visualization.
+ *
+ * <p>Note: UI (Swing) and strategy callbacks may run on different threads. The fields are therefore
+ * kept simple and thread-visible (volatile) and the bait list is thread-safe.</p>
  */
-public class WorldState {
+public final class WorldState {
 
-    /**
-     * When true, the bot should not issue movement commands.
-     */
-    public boolean paused;
+    @Setter
+    @Getter
+    private volatile boolean paused;
 
-    /**
-     * Snapshot list of currently known baits.
-     */
-    public List<Bait> activeBaits = new ArrayList<>();
+    @Setter
+    @Getter
+    private volatile boolean avoidCollisions;
 
-    /**
-     * Currently selected target bait.
-     */
-    public Bait currentTarget;
+    private final CopyOnWriteArrayList<Bait> activeBaits = new CopyOnWriteArrayList<>();
 
-    /**
-     * Cached score value for the current target.
-     */
-    public double currentTargetScoreValue;
+    @Getter
+    private volatile Bait currentTarget;
+    @Getter
+    private volatile double currentTargetScoreValue = Double.NEGATIVE_INFINITY;
 
-    /**
-     * Cached path cells from the current player position to the target.
-     * Each entry is an int array: [x, y].
-     */
-    public List<int[]> currentPathCells = new ArrayList<>();
+    @Getter
+    private volatile List<Point> currentPath = List.of();
 
-    public WorldState() {
+    public List<Bait> getActiveBaits() {
+        return activeBaits;
+    }
+
+    public void addBait(Bait bait) {
+        if (bait != null) {
+            activeBaits.addIfAbsent(bait);
+        }
+    }
+
+    public void removeBait(Bait bait) {
+        if (bait != null) {
+            activeBaits.remove(bait);
+        }
+    }
+
+    public void setCurrentTarget(Bait target, double scoreValue) {
+        this.currentTarget = target;
+        this.currentTargetScoreValue = scoreValue;
+    }
+
+    public void clearTargetIfEquals(Bait bait) {
+        Bait target = this.currentTarget;
+        if (target != null && target.equals(bait)) {
+            setCurrentTarget(null, Double.NEGATIVE_INFINITY);
+        }
+    }
+
+    public void setCurrentPath(List<Point> path) {
+        this.currentPath = (path == null) ? List.of() : path;
     }
 }

@@ -11,7 +11,7 @@ import de.dreamcube.mazegame.client.maze.strategy.VisualizationComponent;
 import de.dreamcube.mazegame.client.maze.strategy.tarnished.model.MazeModel;
 import de.dreamcube.mazegame.client.maze.strategy.tarnished.model.WorldState;
 import de.dreamcube.mazegame.client.maze.strategy.tarnished.pathfinding.OrientedBfs;
-import de.dreamcube.mazegame.client.maze.strategy.tarnished.ui.SimpleBotControlPanel;
+import de.dreamcube.mazegame.client.maze.strategy.tarnished.ui.BotControlPanel;
 import de.dreamcube.mazegame.client.maze.strategy.tarnished.ui.TargetVisualization;
 import de.dreamcube.mazegame.common.maze.BaitType;
 import de.dreamcube.mazegame.common.maze.ViewDirection;
@@ -21,14 +21,18 @@ import javax.swing.JPanel;
 import java.util.List;
 
 /**
- * Simple and effective bot:
- * Oriented BFS for shortest actions + target selection by (baitValue - distancePenalty * steps).
+ * A simple but effective bot:
+ * <ul>
+ *     <li>Pathfinding: oriented BFS over (x,y,dir) to minimize number of actions (ticks).</li>
+ *     <li>Decision: choose a target by score = baitValue - distancePenalty * steps.</li>
+ *     <li>Stability: keep the current target unless a new one is clearly better (anti ping-pong).</li>
+ * </ul>
  */
 @Bot(value = "Tarnished", flavor = "Rise Tarnished")
 public class BfsScoringStrategy extends Strategy implements BaitEventListener, MazeEventListener {
 
     /**
-     * Lambda: how much one step (one tick) "costs" in score.
+     * How much one step (one tick) "costs" in score.
      * Tune this if the bot goes too greedy or too short-sighted.
      */
     private static final double DISTANCE_PENALTY_PER_STEP = 10.0;
@@ -41,144 +45,151 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     private MazeModel mazeModel;
     private WorldState worldState;
     private OrientedBfs orientedBfs;
-    private SimpleBotControlPanel controlPanel;
-    private TargetVisualization targetVisualization;
-
-    public BfsScoringStrategy() {
-    }
+    private BotControlPanel controlPanel;
+    private TargetVisualization visualization;
 
     @Override
     protected void initializeStrategy() {
         mazeModel = new MazeModel();
         worldState = new WorldState();
         orientedBfs = new OrientedBfs(mazeModel);
-        controlPanel = new SimpleBotControlPanel(worldState);
-        targetVisualization = new TargetVisualization(worldState);
+        controlPanel = new BotControlPanel(worldState);
+        visualization = new TargetVisualization(worldState);
     }
 
+    @NotNull
     @Override
     protected Move getNextMove() {
-        if (worldState != null && worldState.paused) {
-            return Move.DO_NOTHING;
-        }
-        if (mazeModel == null || mazeModel.walkable == null || mazeModel.width <= 0 || mazeModel.height <= 0) {
+        if (worldState.isPaused() || !mazeModel.hasMaze()) {
+            worldState.setCurrentPath(List.of());
             return Move.DO_NOTHING;
         }
 
-        PlayerSnapshot ownPlayerSnapshot = getMazeClient().getOwnPlayerSnapshot();
-        int playerX = ownPlayerSnapshot.getX();
-        int playerY = ownPlayerSnapshot.getY();
-        ViewDirection playerDirection = ownPlayerSnapshot.getViewDirection();
+        PlayerSnapshot own = getMazeClient().getOwnPlayerSnapshot();
+        int playerX = own.getX();
+        int playerY = own.getY();
+        ViewDirection playerDirection = own.getViewDirection();
 
-        boolean[][] trapCells = buildTrapCellMap();
+        List<Bait> baits = worldState.getActiveBaits();
+
+        // 1) Prefer paths that do NOT step on known traps.
+        boolean[][] trapCells = buildTrapCellMap(baits);
         orientedBfs.computeFrom(playerX, playerY, playerDirection, trapCells);
 
-        // Keep previous target if still present and reachable.
-        Bait previousTarget = worldState.currentTarget;
-        double previousTargetScore = Double.NEGATIVE_INFINITY;
-        if (previousTarget != null && worldState.activeBaits.contains(previousTarget)) {
-            int previousTargetDistance = orientedBfs.distanceTo(previousTarget.getX(), previousTarget.getY());
-            if (previousTargetDistance != Integer.MAX_VALUE) {
-                previousTargetScore = scoreOf(previousTarget, previousTargetDistance);
-            } else {
-                previousTarget = null;
-            }
-        } else {
-            previousTarget = null;
+        TargetCandidate previousCandidate = evaluatePreviousTargetCandidate(baits);
+        TargetCandidate bestCandidate = findBestNonTrapCandidate(baits);
+
+        // 2) If no reachable non-trap exists WITHOUT stepping on traps, allow trap traversal.
+        if (bestCandidate == null) {
+            orientedBfs.computeFrom(playerX, playerY, playerDirection, null);
+            bestCandidate = findBestNonTrapCandidate(baits);
         }
 
-        // Find best non-trap target without stepping on traps.
-        Bait bestTarget = null;
-        double bestTargetScore = Double.NEGATIVE_INFINITY;
-        for (Bait bait : worldState.activeBaits) {
+        // 3) Still nothing? As a last resort, allow trap targets (better than standing still forever).
+        if (bestCandidate == null) {
+            bestCandidate = findBestAnyCandidate(baits);
+        }
+
+        TargetCandidate selected = selectTargetWithHysteresis(previousCandidate, bestCandidate);
+        worldState.setCurrentTarget(selected == null ? null : selected.bait, selected == null ? Double.NEGATIVE_INFINITY : selected.score);
+
+        if (selected != null) {
+            worldState.setCurrentPath(orientedBfs.getPathTo(selected.bait.getX(), selected.bait.getY()));
+            Move move = orientedBfs.firstMoveTo(selected.bait.getX(), selected.bait.getY());
+            if (move != Move.DO_NOTHING) {
+                return move;
+            }
+        } else {
+            worldState.setCurrentPath(List.of());
+        }
+
+        // Fallback: avoid looking "stuck" if no good target exists.
+        return fallbackMove(playerX, playerY, playerDirection);
+    }
+
+    private TargetCandidate selectTargetWithHysteresis(TargetCandidate previous, TargetCandidate best) {
+        if (previous == null) {
+            return best;
+        }
+        if (best == null) {
+            return previous;
+        }
+        return shouldSwitchTarget(previous.score, best.score) ? best : previous;
+    }
+
+    private boolean shouldSwitchTarget(double currentScore, double candidateScore) {
+        // For positive scores, require a clear improvement. For <= 0, only switch if strictly better.
+        if (currentScore <= 0) {
+            return candidateScore > currentScore;
+        }
+        return candidateScore > currentScore * TARGET_IMPROVEMENT_MULTIPLIER;
+    }
+
+    private TargetCandidate evaluatePreviousTargetCandidate(List<Bait> baits) {
+        Bait previous = worldState.getCurrentTarget();
+        if (previous == null || !baits.contains(previous)) {
+            return null;
+        }
+
+        int distance = orientedBfs.distanceTo(previous.getX(), previous.getY());
+        if (distance == Integer.MAX_VALUE) {
+            return null;
+        }
+
+        return new TargetCandidate(previous, scoreOf(previous, distance), distance);
+    }
+
+    private TargetCandidate findBestNonTrapCandidate(List<Bait> baits) {
+        TargetCandidate best = null;
+        for (Bait bait : baits) {
             if (bait.getType() == BaitType.TRAP) {
                 continue;
             }
-            int baitDistance = orientedBfs.distanceTo(bait.getX(), bait.getY());
-            if (baitDistance == Integer.MAX_VALUE) {
-                continue;
-            }
-            double baitScore = scoreOf(bait, baitDistance);
-            if (baitScore > bestTargetScore) {
-                bestTarget = bait;
-                bestTargetScore = baitScore;
+            TargetCandidate candidate = evaluateCandidate(bait);
+            if (candidate != null && (best == null || candidate.score > best.score)) {
+                best = candidate;
             }
         }
+        return best;
+    }
 
-        if (bestTarget == null) {
-            // No non-trap bait reachable without stepping on traps -> allow trap traversal.
-            orientedBfs.computeFrom(playerX, playerY, playerDirection, null);
-            for (Bait bait : worldState.activeBaits) {
-                if (bait.getType() == BaitType.TRAP) {
-                    continue;
-                }
-                int baitDistance = orientedBfs.distanceTo(bait.getX(), bait.getY());
-                if (baitDistance == Integer.MAX_VALUE) {
-                    continue;
-                }
-                double baitScore = scoreOf(bait, baitDistance);
-                if (baitScore > bestTargetScore) {
-                    bestTarget = bait;
-                    bestTargetScore = baitScore;
-                }
+    private TargetCandidate findBestAnyCandidate(List<Bait> baits) {
+        TargetCandidate best = null;
+        for (Bait bait : baits) {
+            TargetCandidate candidate = evaluateCandidate(bait);
+            if (candidate != null && (best == null || candidate.score > best.score)) {
+                best = candidate;
             }
         }
+        return best;
+    }
 
-        if (bestTarget == null) {
-            // Still no non-trap target -> allow trap targets as a last resort.
-            for (Bait bait : worldState.activeBaits) {
-                int baitDistance = orientedBfs.distanceTo(bait.getX(), bait.getY());
-                if (baitDistance == Integer.MAX_VALUE) {
-                    continue;
-                }
-                double baitScore = scoreOf(bait, baitDistance);
-                if (baitScore > bestTargetScore) {
-                    bestTarget = bait;
-                    bestTargetScore = baitScore;
-                }
-            }
+    private TargetCandidate evaluateCandidate(Bait bait) {
+        int distance = orientedBfs.distanceTo(bait.getX(), bait.getY());
+        if (distance == Integer.MAX_VALUE) {
+            return null;
         }
-
-        // Target selection with anti ping-pong.
-        Bait selectedTarget = previousTarget;
-        double selectedTargetScore = previousTargetScore;
-        if (previousTarget == null) {
-            selectedTarget = bestTarget;
-            selectedTargetScore = bestTargetScore;
-        } else if (bestTarget != null && bestTargetScore > previousTargetScore * TARGET_IMPROVEMENT_MULTIPLIER) {
-            selectedTarget = bestTarget;
-            selectedTargetScore = bestTargetScore;
-        }
-
-        worldState.currentTarget = selectedTarget;
-        worldState.currentTargetScoreValue = selectedTargetScore;
-
-        // Move towards target (only the first action of the shortest path).
-        if (selectedTarget != null) {
-            Move moveTowardsTarget = orientedBfs.firstMoveTo(selectedTarget.getX(), selectedTarget.getY());
-            worldState.currentPathCells = orientedBfs.getPathCellsTo(selectedTarget.getX(), selectedTarget.getY());
-            if (moveTowardsTarget != Move.DO_NOTHING) {
-                return moveTowardsTarget;
-            }
-        } else {
-            worldState.currentPathCells = java.util.List.of();
-        }
-
-        // Fallback: explore-ish movement so the bot does not look stuck.
-        return fallbackMove(playerX, playerY, playerDirection);
+        return new TargetCandidate(bait, scoreOf(bait, distance), distance);
     }
 
     private double scoreOf(Bait bait, int distanceSteps) {
         return bait.getScore() - (DISTANCE_PENALTY_PER_STEP * distanceSteps);
     }
 
-    private boolean[][] buildTrapCellMap() {
-        boolean[][] trapCells = new boolean[mazeModel.width][mazeModel.height];
-        for (Bait bait : worldState.activeBaits) {
-            if (bait.getType() == BaitType.TRAP
-                    && bait.getX() >= 0 && bait.getY() >= 0
-                    && bait.getX() < mazeModel.width && bait.getY() < mazeModel.height) {
-                trapCells[bait.getX()][bait.getY()] = true;
+
+    private boolean[][] buildTrapCellMap(List<Bait> baits) {
+        int width = mazeModel.getWidth();
+        int height = mazeModel.getHeight();
+        boolean[][] trapCells = new boolean[width][height];
+
+        for (Bait bait : baits) {
+            if (bait.getType() != BaitType.TRAP) {
+                continue;
+            }
+            int x = bait.getX();
+            int y = bait.getY();
+            if (x >= 0 && y >= 0 && x < width && y < height) {
+                trapCells[x][y] = true;
             }
         }
         return trapCells;
@@ -186,27 +197,18 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
 
     @Override
     public void onBaitAppeared(@NotNull Bait bait) {
-        if (worldState != null) {
-            worldState.activeBaits.add(bait);
-        }
+        worldState.addBait(bait);
     }
 
     @Override
     public void onBaitVanished(@NotNull Bait bait) {
-        if (worldState != null) {
-            worldState.activeBaits.remove(bait);
-            if (bait.equals(worldState.currentTarget)) {
-                worldState.currentTarget = null;
-                worldState.currentTargetScoreValue = Double.NEGATIVE_INFINITY;
-            }
-        }
+        worldState.removeBait(bait);
+        worldState.clearTargetIfEquals(bait);
     }
 
     @Override
     public void onMazeReceived(int width, int height, @NotNull List<String> mazeLines) {
-        if (mazeModel != null) {
-            mazeModel.updateFromMaze(width, height, mazeLines);
-        }
+        mazeModel.updateFromMaze(width, height, mazeLines);
     }
 
     @Override
@@ -216,46 +218,38 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
 
     @Override
     public VisualizationComponent getVisualizationComponent() {
-        return targetVisualization;
-    }
-
-    @Override
-    public void beforeGoodbye() {
-        // No cleanup needed.
+        return visualization;
     }
 
     /**
-     * Basic fallback if no reachable positive bait exists.
+     * Basic fallback if no reachable target exists.
      * Try stepping forward if possible; otherwise keep turning.
      */
     private Move fallbackMove(int playerX, int playerY, ViewDirection playerDirection) {
-        int nextX = playerX + getStepDeltaX(playerDirection);
-        int nextY = playerY + getStepDeltaY(playerDirection);
-        if (isWithinMazeBounds(nextX, nextY) && mazeModel.walkable[nextX][nextY]) {
+        int nextX = playerX + stepDeltaX(playerDirection);
+        int nextY = playerY + stepDeltaY(playerDirection);
+        if (mazeModel.isWalkable(nextX, nextY)) {
             return Move.STEP;
         }
         return Move.TURN_L;
     }
 
-    private boolean isWithinMazeBounds(int positionX, int positionY) {
-        return positionX >= 0 && positionY >= 0 && positionX < mazeModel.width && positionY < mazeModel.height;
-    }
-
-    private int getStepDeltaX(ViewDirection direction) {
+    private int stepDeltaX(ViewDirection direction) {
         return switch (direction) {
-            case NORTH -> 0;
+            case NORTH, SOUTH -> 0;
             case EAST -> 1;
-            case SOUTH -> 0;
             case WEST -> -1;
         };
     }
 
-    private int getStepDeltaY(ViewDirection direction) {
+    private int stepDeltaY(ViewDirection direction) {
         return switch (direction) {
             case NORTH -> -1;
-            case EAST -> 0;
+            case EAST, WEST -> 0;
             case SOUTH -> 1;
-            case WEST -> 0;
         };
+    }
+
+    private record TargetCandidate(Bait bait, double score, int distance) {
     }
 }

@@ -1,34 +1,69 @@
 package de.dreamcube.mazegame.client.maze.strategy.tarnished.model;
 
+import lombok.Getter;
+
 import java.util.List;
+import java.util.Objects;
 
 /**
- * Stores the maze grid for pathfinding.
+ * Stores a walkability grid of the maze for pathfinding.
+ *
+ * <p>The maze is received as a list of text lines. Currently, only '.' is considered walkable;
+ * every other character is treated as blocked.</p>
  */
-public class MazeModel {
+public final class MazeModel {
 
-    public int width;
-    public int height;
-    public boolean[][] walkable;
+    @Getter
+    private int width;
+    @Getter
+    private int height;
+    private boolean[][] walkable;
 
-    public MazeModel() {
+    public boolean hasMaze() {
+        return walkable != null && width > 0 && height > 0;
+    }
+
+    public boolean isWithinBounds(int x, int y) {
+        return x >= 0 && y >= 0 && x < width && y < height;
+    }
+
+    public boolean isWalkable(int x, int y) {
+        return isWithinBounds(x, y) && walkable != null && walkable[x][y];
     }
 
     /**
      * Updates the maze grid from server-provided lines.
-     * Walkable: '.', everything else is treated as blocked.
+     *
+     * @param width  maze width
+     * @param height maze height
+     * @param lines  maze rows (top to bottom)
      */
     public void updateFromMaze(int width, int height, List<String> lines) {
+        if (width <= 0 || height <= 0 || lines == null) {
+            clear();
+            return;
+        }
+
         this.width = width;
         this.height = height;
-        this.walkable = new boolean[width][height];
 
-        for (int rowIndex = 0; rowIndex < height; rowIndex++) {
-            String line = lines.get(rowIndex);
-            for (int columnIndex = 0; columnIndex < width; columnIndex++) {
-                char cellChar = line.charAt(columnIndex);
-                walkable[columnIndex][rowIndex] = (cellChar == '.');
+        boolean[][] nextWalkable = new boolean[width][height];
+
+        int rowCount = Math.min(height, lines.size());
+        for (int y = 0; y < rowCount; y++) {
+            String line = Objects.toString(lines.get(y), "");
+            int colCount = Math.min(width, line.length());
+            for (int x = 0; x < colCount; x++) {
+                nextWalkable[x][y] = (line.charAt(x) == '.');
             }
         }
+
+        this.walkable = nextWalkable;
+    }
+
+    private void clear() {
+        width = 0;
+        height = 0;
+        walkable = null;
     }
 }
