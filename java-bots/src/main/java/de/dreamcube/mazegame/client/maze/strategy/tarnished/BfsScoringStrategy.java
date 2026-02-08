@@ -21,25 +21,30 @@ import javax.swing.JPanel;
 import java.util.List;
 
 /**
- * A simple but effective bot:
+ * An autonomous maze navigation strategy using oriented BFS pathfinding and value-based scoring.
+ *
+ * <p>The strategy consists of three main components:</p>
  * <ul>
- *     <li>Pathfinding: oriented BFS over (x,y,dir) to minimize number of actions (ticks).</li>
- *     <li>Decision: choose a target by score = baitValue - distancePenalty * steps.</li>
- *     <li>Stability: keep the current target unless a new one is clearly better (anti ping-pong).</li>
+ *     <li><strong>Pathfinding:</strong> Uses oriented BFS over (x, y, direction) states to find
+ *         paths that minimize the number of actions (ticks) required to reach targets.</li>
+ *     <li><strong>Target Selection:</strong> Evaluates potential targets using a scoring function:
+ *         score = baitValue - (distancePenalty × steps). This balances the value of collecting
+ *         a bait against the cost of traveling to it.</li>
+ *     <li><strong>Stability:</strong> Implements hysteresis to prevent oscillation between targets.
+ *         A new target must be significantly better before switching.</li>
  * </ul>
+ *
+ * <p>The strategy prioritizes paths that avoid known traps, but will traverse them if necessary
+ * to reach valuable targets. As a last resort, trap baits may be targeted if no other options exist.</p>
+ *
+ * @see OrientedBfs
+ * @see WorldState
+ * @see MazeModel
  */
 @Bot(value = "Tarnished", flavor = "Rise Tarnished")
 public class BfsScoringStrategy extends Strategy implements BaitEventListener, MazeEventListener {
 
-    /**
-     * How much one step (one tick) "costs" in score.
-     * Tune this if the bot goes too greedy or too short-sighted.
-     */
     private static final double DISTANCE_PENALTY_PER_STEP = 10.0;
-
-    /**
-     * Anti ping-pong: keep the current target unless a new one is clearly better.
-     */
     private static final double TARGET_IMPROVEMENT_MULTIPLIER = 1.2;
 
     private MazeModel mazeModel;
@@ -48,6 +53,10 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     private BotControlPanel controlPanel;
     private TargetVisualization visualization;
 
+    /**
+     * Initializes the strategy components including maze model, world state, pathfinding,
+     * control panel, and visualization.
+     */
     @Override
     protected void initializeStrategy() {
         mazeModel = new MazeModel();
@@ -57,6 +66,21 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
         visualization = new TargetVisualization(worldState);
     }
 
+    /**
+     * Determines the next move for the bot based on current game state.
+     *
+     * <p>The decision process follows these steps:</p>
+     * <ol>
+     *     <li>Check if bot is paused or maze is not yet received</li>
+     *     <li>Attempt to find a reachable non-trap target while avoiding trap cells</li>
+     *     <li>If no path exists without traversing traps, allow trap traversal</li>
+     *     <li>If still no target is found, consider trap baits as last resort</li>
+     *     <li>Apply hysteresis to prevent frequent target switching</li>
+     *     <li>If no viable target exists, attempt a fallback exploratory move</li>
+     * </ol>
+     *
+     * @return the next move to execute (TURN_L, TURN_R, STEP, or DO_NOTHING)
+     */
     @NotNull
     @Override
     protected Move getNextMove() {
@@ -65,37 +89,34 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
             return Move.DO_NOTHING;
         }
 
-        PlayerSnapshot own = getMazeClient().getOwnPlayerSnapshot();
-        int playerX = own.getX();
-        int playerY = own.getY();
-        ViewDirection playerDirection = own.getViewDirection();
+        PlayerSnapshot ownPlayer = getMazeClient().getOwnPlayerSnapshot();
+        int playerX = ownPlayer.getX();
+        int playerY = ownPlayer.getY();
+        ViewDirection playerDirection = ownPlayer.getViewDirection();
 
-        List<Bait> baits = worldState.getActiveBaits();
+        List<Bait> availableBaits = worldState.getActiveBaits();
 
-        // 1) Prefer paths that do NOT step on known traps.
-        boolean[][] trapCells = buildTrapCellMap(baits);
+        boolean[][] trapCells = buildTrapCellMap(availableBaits);
         orientedBfs.computeFrom(playerX, playerY, playerDirection, trapCells);
 
-        TargetCandidate previousCandidate = evaluatePreviousTargetCandidate(baits);
-        TargetCandidate bestCandidate = findBestNonTrapCandidate(baits);
+        TargetCandidate previousCandidate = evaluatePreviousTarget(availableBaits);
+        TargetCandidate bestCandidate = findBestNonTrapTarget(availableBaits);
 
-        // 2) If no reachable non-trap exists WITHOUT stepping on traps, allow trap traversal.
         if (bestCandidate == null) {
             orientedBfs.computeFrom(playerX, playerY, playerDirection, null);
-            bestCandidate = findBestNonTrapCandidate(baits);
+            bestCandidate = findBestNonTrapTarget(availableBaits);
         }
 
-        // 3) Still nothing? As a last resort, allow trap targets (better than standing still forever).
         if (bestCandidate == null) {
-            bestCandidate = findBestAnyCandidate(baits);
+            bestCandidate = findBestAnyTarget(availableBaits);
         }
 
-        TargetCandidate selected = selectTargetWithHysteresis(previousCandidate, bestCandidate);
-        worldState.setCurrentTarget(selected == null ? null : selected.bait, selected == null ? Double.NEGATIVE_INFINITY : selected.score);
+        TargetCandidate selectedTarget = selectTargetWithHysteresis(previousCandidate, bestCandidate);
+        updateWorldStateWithTarget(selectedTarget);
 
-        if (selected != null) {
-            worldState.setCurrentPath(orientedBfs.getPathTo(selected.bait.getX(), selected.bait.getY()));
-            Move move = orientedBfs.firstMoveTo(selected.bait.getX(), selected.bait.getY());
+        if (selectedTarget != null) {
+            worldState.setCurrentPath(orientedBfs.getPathTo(selectedTarget.bait.getX(), selectedTarget.bait.getY()));
+            Move move = orientedBfs.firstMoveTo(selectedTarget.bait.getX(), selectedTarget.bait.getY());
             if (move != Move.DO_NOTHING) {
                 return move;
             }
@@ -103,86 +124,148 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
             worldState.setCurrentPath(List.of());
         }
 
-        // Fallback: avoid looking "stuck" if no good target exists.
-        return fallbackMove(playerX, playerY, playerDirection);
+        return calculateFallbackMove(playerX, playerY, playerDirection);
     }
 
-    private TargetCandidate selectTargetWithHysteresis(TargetCandidate previous, TargetCandidate best) {
-        if (previous == null) {
-            return best;
+    /**
+     * Selects the target to pursue, applying hysteresis to prevent oscillation.
+     *
+     * <p>Hysteresis ensures that the bot doesn't constantly switch between similar-valued targets.
+     * The new target must be significantly better (by {@link #TARGET_IMPROVEMENT_MULTIPLIER})
+     * before a switch occurs.</p>
+     *
+     * @param previousCandidate the currently targeted candidate, may be null
+     * @param newCandidate the potential new target candidate, may be null
+     * @return the selected target candidate, or null if no valid targets exist
+     */
+    private TargetCandidate selectTargetWithHysteresis(TargetCandidate previousCandidate,
+                                                       TargetCandidate newCandidate) {
+        if (previousCandidate == null) {
+            return newCandidate;
         }
-        if (best == null) {
-            return previous;
+        if (newCandidate == null) {
+            return previousCandidate;
         }
-        return shouldSwitchTarget(previous.score, best.score) ? best : previous;
+        return shouldSwitchTarget(previousCandidate.score, newCandidate.score)
+                ? newCandidate
+                : previousCandidate;
     }
 
+    /**
+     * Determines whether to switch from the current target to a new candidate.
+     *
+     * <p>For positive scores, requires the new score to exceed the current by the improvement
+     * multiplier. For non-positive scores, any improvement triggers a switch.</p>
+     *
+     * @param currentScore the score of the current target
+     * @param candidateScore the score of the potential new target
+     * @return true if a target switch should occur, false otherwise
+     */
     private boolean shouldSwitchTarget(double currentScore, double candidateScore) {
-        // For positive scores, require a clear improvement. For <= 0, only switch if strictly better.
         if (currentScore <= 0) {
             return candidateScore > currentScore;
         }
         return candidateScore > currentScore * TARGET_IMPROVEMENT_MULTIPLIER;
     }
 
-    private TargetCandidate evaluatePreviousTargetCandidate(List<Bait> baits) {
-        Bait previous = worldState.getCurrentTarget();
-        if (previous == null || !baits.contains(previous)) {
+    /**
+     * Evaluates the current target to determine if it should remain the active target.
+     *
+     * @param availableBaits the list of currently visible baits
+     * @return a candidate wrapper for the current target, or null if it's no longer valid
+     */
+    private TargetCandidate evaluatePreviousTarget(List<Bait> availableBaits) {
+        Bait currentTarget = worldState.getCurrentTarget();
+        if (currentTarget == null || !availableBaits.contains(currentTarget)) {
             return null;
         }
 
-        int distance = orientedBfs.distanceTo(previous.getX(), previous.getY());
+        int distance = orientedBfs.distanceTo(currentTarget.getX(), currentTarget.getY());
         if (distance == Integer.MAX_VALUE) {
             return null;
         }
 
-        return new TargetCandidate(previous, scoreOf(previous, distance), distance);
+        return new TargetCandidate(currentTarget, calculateScore(currentTarget, distance), distance);
     }
 
-    private TargetCandidate findBestNonTrapCandidate(List<Bait> baits) {
-        TargetCandidate best = null;
-        for (Bait bait : baits) {
+    /**
+     * Finds the best non-trap bait to target from the available baits.
+     *
+     * @param availableBaits the list of currently visible baits
+     * @return the best non-trap target candidate, or null if none are reachable
+     */
+    private TargetCandidate findBestNonTrapTarget(List<Bait> availableBaits) {
+        TargetCandidate bestCandidate = null;
+        for (Bait bait : availableBaits) {
             if (bait.getType() == BaitType.TRAP) {
                 continue;
             }
-            TargetCandidate candidate = evaluateCandidate(bait);
-            if (candidate != null && (best == null || candidate.score > best.score)) {
-                best = candidate;
+            TargetCandidate candidate = evaluateTargetCandidate(bait);
+            if (candidate != null && (bestCandidate == null || candidate.score > bestCandidate.score)) {
+                bestCandidate = candidate;
             }
         }
-        return best;
+        return bestCandidate;
     }
 
-    private TargetCandidate findBestAnyCandidate(List<Bait> baits) {
-        TargetCandidate best = null;
-        for (Bait bait : baits) {
-            TargetCandidate candidate = evaluateCandidate(bait);
-            if (candidate != null && (best == null || candidate.score > best.score)) {
-                best = candidate;
+    /**
+     * Finds the best target from all available baits, including traps.
+     *
+     * <p>This method is used as a last resort when no non-trap targets are reachable.</p>
+     *
+     * @param availableBaits the list of currently visible baits
+     * @return the best target candidate of any type, or null if none are reachable
+     */
+    private TargetCandidate findBestAnyTarget(List<Bait> availableBaits) {
+        TargetCandidate bestCandidate = null;
+        for (Bait bait : availableBaits) {
+            TargetCandidate candidate = evaluateTargetCandidate(bait);
+            if (candidate != null && (bestCandidate == null || candidate.score > bestCandidate.score)) {
+                bestCandidate = candidate;
             }
         }
-        return best;
+        return bestCandidate;
     }
 
-    private TargetCandidate evaluateCandidate(Bait bait) {
+    /**
+     * Evaluates a single bait as a potential target candidate.
+     *
+     * @param bait the bait to evaluate
+     * @return a candidate wrapper with calculated score, or null if unreachable
+     */
+    private TargetCandidate evaluateTargetCandidate(Bait bait) {
         int distance = orientedBfs.distanceTo(bait.getX(), bait.getY());
         if (distance == Integer.MAX_VALUE) {
             return null;
         }
-        return new TargetCandidate(bait, scoreOf(bait, distance), distance);
+        return new TargetCandidate(bait, calculateScore(bait, distance), distance);
     }
 
-    private double scoreOf(Bait bait, int distanceSteps) {
+    /**
+     * Calculates the attractiveness score for a bait considering its value and distance.
+     *
+     * <p>The scoring formula is: score = baitValue - (distancePenalty × steps)</p>
+     *
+     * @param bait the bait to score
+     * @param distanceSteps the number of steps required to reach the bait
+     * @return the calculated score (can be negative for distant or low-value baits)
+     */
+    private double calculateScore(Bait bait, int distanceSteps) {
         return bait.getScore() - (DISTANCE_PENALTY_PER_STEP * distanceSteps);
     }
 
-
-    private boolean[][] buildTrapCellMap(List<Bait> baits) {
+    /**
+     * Constructs a 2D boolean array marking all cells containing trap baits.
+     *
+     * @param availableBaits the list of currently visible baits
+     * @return a 2D array where true indicates a trap cell
+     */
+    private boolean[][] buildTrapCellMap(List<Bait> availableBaits) {
         int width = mazeModel.getWidth();
         int height = mazeModel.getHeight();
         boolean[][] trapCells = new boolean[width][height];
 
-        for (Bait bait : baits) {
+        for (Bait bait : availableBaits) {
             if (bait.getType() != BaitType.TRAP) {
                 continue;
             }
@@ -193,6 +276,39 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
             }
         }
         return trapCells;
+    }
+
+    /**
+     * Updates the world state with the selected target information.
+     *
+     * @param selectedTarget the target candidate to set, or null to clear the current target
+     */
+    private void updateWorldStateWithTarget(TargetCandidate selectedTarget) {
+        if (selectedTarget != null) {
+            worldState.setCurrentTarget(selectedTarget.bait, selectedTarget.score);
+        } else {
+            worldState.setCurrentTarget(null, Double.NEGATIVE_INFINITY);
+        }
+    }
+
+    /**
+     * Calculates a fallback move when no viable target exists.
+     *
+     * <p>The fallback strategy attempts to step forward if possible; otherwise, turns left
+     * to continue exploring.</p>
+     *
+     * @param playerX the player's current x-coordinate
+     * @param playerY the player's current y-coordinate
+     * @param playerDirection the player's current facing direction
+     * @return STEP if forward cell is walkable, otherwise TURN_L
+     */
+    private Move calculateFallbackMove(int playerX, int playerY, ViewDirection playerDirection) {
+        int nextX = playerX + DirectionUtil.getDeltaX(playerDirection);
+        int nextY = playerY + DirectionUtil.getDeltaY(playerDirection);
+        if (mazeModel.isWalkable(nextX, nextY)) {
+            return Move.STEP;
+        }
+        return Move.TURN_L;
     }
 
     @Override
@@ -222,34 +338,46 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     }
 
     /**
-     * Basic fallback if no reachable target exists.
-     * Try stepping forward if possible; otherwise keep turning.
+     * Internal representation of a potential target with its associated metadata.
+     *
+     * @param bait the bait being considered as a target
+     * @param score the calculated attractiveness score for this target
+     * @param distance the number of steps required to reach this target
      */
-    private Move fallbackMove(int playerX, int playerY, ViewDirection playerDirection) {
-        int nextX = playerX + stepDeltaX(playerDirection);
-        int nextY = playerY + stepDeltaY(playerDirection);
-        if (mazeModel.isWalkable(nextX, nextY)) {
-            return Move.STEP;
-        }
-        return Move.TURN_L;
-    }
-
-    private int stepDeltaX(ViewDirection direction) {
-        return switch (direction) {
-            case NORTH, SOUTH -> 0;
-            case EAST -> 1;
-            case WEST -> -1;
-        };
-    }
-
-    private int stepDeltaY(ViewDirection direction) {
-        return switch (direction) {
-            case NORTH -> -1;
-            case EAST, WEST -> 0;
-            case SOUTH -> 1;
-        };
-    }
-
     private record TargetCandidate(Bait bait, double score, int distance) {
+    }
+
+    /**
+     * Utility class for direction-related calculations to eliminate code duplication.
+     */
+    private static final class DirectionUtil {
+
+        /**
+         * Calculates the x-coordinate delta for stepping in the given direction.
+         *
+         * @param direction the facing direction
+         * @return 1 for EAST, -1 for WEST, 0 for NORTH or SOUTH
+         */
+        static int getDeltaX(ViewDirection direction) {
+            return switch (direction) {
+                case NORTH, SOUTH -> 0;
+                case EAST -> 1;
+                case WEST -> -1;
+            };
+        }
+
+        /**
+         * Calculates the y-coordinate delta for stepping in the given direction.
+         *
+         * @param direction the facing direction
+         * @return -1 for NORTH, 1 for SOUTH, 0 for EAST or WEST
+         */
+        static int getDeltaY(ViewDirection direction) {
+            return switch (direction) {
+                case NORTH -> -1;
+                case EAST, WEST -> 0;
+                case SOUTH -> 1;
+            };
+        }
     }
 }
