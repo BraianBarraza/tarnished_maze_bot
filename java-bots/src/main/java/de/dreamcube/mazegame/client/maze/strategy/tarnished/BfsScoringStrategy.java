@@ -103,21 +103,16 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
 
         List<Bait> availableBaits = worldState.getActiveBaits();
 
-        // Level 1: Try to find non-trap targets while avoiding trap cells
         boolean[][] trapCells = buildTrapCellMap(availableBaits);
         orientedBfs.computeFrom(playerX, playerY, playerDirection, trapCells);
 
         TargetCandidate previousCandidate = evaluatePreviousTarget(availableBaits);
         TargetCandidate bestCandidate = findBestNonTrapTarget(availableBaits);
 
-        // Level 2: If no path exists without traversing traps, allow trap traversal to reach non-trap targets
         if (bestCandidate == null) {
             orientedBfs.computeFrom(playerX, playerY, playerDirection, null);
             bestCandidate = findBestNonTrapTarget(availableBaits);
         }
-
-        // Level 3: If still no non-trap target found, we do NOT target traps
-        // Instead, we enter exploration mode (fallback movement)
 
         TargetCandidate selectedTarget = selectTargetWithHysteresis(previousCandidate, bestCandidate);
         updateWorldStateWithTarget(selectedTarget);
@@ -132,7 +127,6 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
             worldState.setCurrentPath(List.of());
         }
 
-        // No valid non-trap target exists - explore the maze
         return calculateFallbackMove(playerX, playerY, playerDirection);
     }
 
