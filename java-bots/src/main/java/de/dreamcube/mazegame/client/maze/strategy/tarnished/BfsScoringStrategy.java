@@ -34,8 +34,12 @@ import java.util.List;
  *         A new target must be significantly better before switching.</li>
  * </ul>
  *
- * <p>The strategy prioritizes paths that avoid known traps, but will traverse them if necessary
- * to reach valuable targets. As a last resort, trap baits may be targeted if no other options exist.</p>
+ * <p><strong>Trap Handling Strategy:</strong></p>
+ * <ul>
+ *     <li>The bot <strong>NEVER intentionally targets trap baits</strong></li>
+ *     <li>It will traverse trap cells if necessary to reach valuable baits</li>
+ *     <li>If only traps are available, the bot enters exploration mode</li>
+ * </ul>
  *
  * @see OrientedBfs
  * @see WorldState
@@ -73,11 +77,14 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
      * <ol>
      *     <li>Check if bot is paused or maze is not yet received</li>
      *     <li>Attempt to find a reachable non-trap target while avoiding trap cells</li>
-     *     <li>If no path exists without traversing traps, allow trap traversal</li>
-     *     <li>If still no target is found, consider trap baits as last resort</li>
+     *     <li>If no path exists without traversing traps, allow trap traversal to reach non-trap targets</li>
+     *     <li>If no non-trap targets exist or are reachable, enter exploration mode</li>
      *     <li>Apply hysteresis to prevent frequent target switching</li>
      *     <li>If no viable target exists, attempt a fallback exploratory move</li>
      * </ol>
+     *
+     * <p><strong>Important:</strong> The bot will NEVER intentionally target trap baits.
+     * If only traps are visible, the bot explores rather than collecting them.</p>
      *
      * @return the next move to execute (TURN_L, TURN_R, STEP, or DO_NOTHING)
      */
@@ -96,20 +103,21 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
 
         List<Bait> availableBaits = worldState.getActiveBaits();
 
+        // Level 1: Try to find non-trap targets while avoiding trap cells
         boolean[][] trapCells = buildTrapCellMap(availableBaits);
         orientedBfs.computeFrom(playerX, playerY, playerDirection, trapCells);
 
         TargetCandidate previousCandidate = evaluatePreviousTarget(availableBaits);
         TargetCandidate bestCandidate = findBestNonTrapTarget(availableBaits);
 
+        // Level 2: If no path exists without traversing traps, allow trap traversal to reach non-trap targets
         if (bestCandidate == null) {
             orientedBfs.computeFrom(playerX, playerY, playerDirection, null);
             bestCandidate = findBestNonTrapTarget(availableBaits);
         }
 
-        if (bestCandidate == null) {
-            bestCandidate = findBestAnyTarget(availableBaits);
-        }
+        // Level 3: If still no non-trap target found, we do NOT target traps
+        // Instead, we enter exploration mode (fallback movement)
 
         TargetCandidate selectedTarget = selectTargetWithHysteresis(previousCandidate, bestCandidate);
         updateWorldStateWithTarget(selectedTarget);
@@ -124,6 +132,7 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
             worldState.setCurrentPath(List.of());
         }
 
+        // No valid non-trap target exists - explore the maze
         return calculateFallbackMove(playerX, playerY, playerDirection);
     }
 
@@ -171,12 +180,19 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     /**
      * Evaluates the current target to determine if it should remain the active target.
      *
+     * <p>Only evaluates non-trap targets. If the current target is a trap or no longer
+     * exists, returns null.</p>
+     *
      * @param availableBaits the list of currently visible baits
      * @return a candidate wrapper for the current target, or null if it's no longer valid
      */
     private TargetCandidate evaluatePreviousTarget(List<Bait> availableBaits) {
         Bait currentTarget = worldState.getCurrentTarget();
         if (currentTarget == null || !availableBaits.contains(currentTarget)) {
+            return null;
+        }
+
+        if (currentTarget.getType() == BaitType.TRAP) {
             return null;
         }
 
@@ -191,6 +207,9 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     /**
      * Finds the best non-trap bait to target from the available baits.
      *
+     * <p>This method explicitly filters out all trap baits and only considers
+     * Gems, Coffee, and Food as potential targets.</p>
+     *
      * @param availableBaits the list of currently visible baits
      * @return the best non-trap target candidate, or null if none are reachable
      */
@@ -200,25 +219,6 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
             if (bait.getType() == BaitType.TRAP) {
                 continue;
             }
-            TargetCandidate candidate = evaluateTargetCandidate(bait);
-            if (candidate != null && (bestCandidate == null || candidate.score > bestCandidate.score)) {
-                bestCandidate = candidate;
-            }
-        }
-        return bestCandidate;
-    }
-
-    /**
-     * Finds the best target from all available baits, including traps.
-     *
-     * <p>This method is used as a last resort when no non-trap targets are reachable.</p>
-     *
-     * @param availableBaits the list of currently visible baits
-     * @return the best target candidate of any type, or null if none are reachable
-     */
-    private TargetCandidate findBestAnyTarget(List<Bait> availableBaits) {
-        TargetCandidate bestCandidate = null;
-        for (Bait bait : availableBaits) {
             TargetCandidate candidate = evaluateTargetCandidate(bait);
             if (candidate != null && (bestCandidate == null || candidate.score > bestCandidate.score)) {
                 bestCandidate = candidate;
@@ -295,7 +295,12 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
      * Calculates a fallback move when no viable target exists.
      *
      * <p>The fallback strategy attempts to step forward if possible; otherwise, turns left
-     * to continue exploring.</p>
+     * to continue exploring. This exploratory behavior is used when:</p>
+     * <ul>
+     *     <li>No non-trap baits are visible</li>
+     *     <li>All non-trap baits are unreachable</li>
+     *     <li>The bot is surrounded by obstacles</li>
+     * </ul>
      *
      * @param playerX the player's current x-coordinate
      * @param playerY the player's current y-coordinate
