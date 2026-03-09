@@ -18,6 +18,7 @@ import de.dreamcube.mazegame.common.maze.ViewDirection;
 import org.jetbrains.annotations.NotNull;
 
 import javax.swing.JPanel;
+import java.awt.Point;
 import java.util.List;
 
 /**
@@ -41,6 +42,10 @@ import java.util.List;
  *     <li>If only traps are available, the bot enters exploration mode</li>
  * </ul>
  *
+ * <p><strong>Thread safety:</strong> All shared mutable strategy state ({@link WorldState},
+ * {@link MazeModel}, and {@link OrientedBfs}) is guarded by a single private lock to ensure
+ * consistent updates across event callbacks and decision-making.</p>
+ *
  * @see OrientedBfs
  * @see WorldState
  * @see MazeModel
@@ -50,6 +55,11 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
 
     private static final double DISTANCE_PENALTY_PER_STEP = 10.0;
     private static final double TARGET_IMPROVEMENT_MULTIPLIER = 1.2;
+
+    /**
+     * Single lock guarding all shared mutable state used by strategy callbacks and pathfinding.
+     */
+    private final Object stateLock = new Object();
 
     private MazeModel mazeModel;
     private WorldState worldState;
@@ -91,51 +101,52 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     @NotNull
     @Override
     protected Move getNextMove() {
-        if (worldState.isPaused() || !mazeModel.hasMaze()) {
-            worldState.setCurrentPath(List.of());
-            return Move.DO_NOTHING;
-        }
-
         PlayerSnapshot ownPlayer = getMazeClient().getOwnPlayerSnapshot();
         int playerX = ownPlayer.getX();
         int playerY = ownPlayer.getY();
         ViewDirection playerDirection = ownPlayer.getViewDirection();
 
-        List<Bait> availableBaits = worldState.getActiveBaits();
-
-        boolean[][] trapCells = buildTrapCellMap(availableBaits);
-        orientedBfs.computeFrom(playerX, playerY, playerDirection, trapCells);
-
-        TargetCandidate previousCandidate = evaluatePreviousTarget(availableBaits);
-        TargetCandidate bestCandidate = findBestNonTrapTarget(availableBaits);
-
-        if (bestCandidate == null) {
-            orientedBfs.computeFrom(playerX, playerY, playerDirection, null);
-            bestCandidate = findBestNonTrapTarget(availableBaits);
-        }
-
-        TargetCandidate selectedTarget = selectTargetWithHysteresis(previousCandidate, bestCandidate);
-        updateWorldStateWithTarget(selectedTarget);
-
-        if (selectedTarget != null) {
-            worldState.setCurrentPath(orientedBfs.getPathTo(selectedTarget.bait.getX(), selectedTarget.bait.getY()));
-            Move move = orientedBfs.firstMoveTo(selectedTarget.bait.getX(), selectedTarget.bait.getY());
-            if (move != Move.DO_NOTHING) {
-                return move;
+        synchronized (stateLock) {
+            if (worldState.isPaused() || !mazeModel.hasMaze()) {
+                worldState.setCurrentPath(List.of());
+                worldState.setCurrentTarget(null, Double.NEGATIVE_INFINITY);
+                return Move.DO_NOTHING;
             }
-        } else {
-            worldState.setCurrentPath(List.of());
-        }
 
-        return calculateFallbackMove(playerX, playerY, playerDirection);
+            List<Bait> availableBaits = worldState.getActiveBaitsSnapshot();
+
+            boolean[][] trapCells = buildTrapCellMap(availableBaits);
+            orientedBfs.computeFrom(playerX, playerY, playerDirection, trapCells);
+
+            TargetCandidate previousCandidate = evaluatePreviousTarget(availableBaits);
+            TargetCandidate bestCandidate = findBestNonTrapTarget(availableBaits);
+
+            if (bestCandidate == null) {
+                orientedBfs.computeFrom(playerX, playerY, playerDirection, null);
+                bestCandidate = findBestNonTrapTarget(availableBaits);
+            }
+
+            TargetCandidate selectedTarget = selectTargetWithHysteresis(previousCandidate, bestCandidate);
+            updateWorldStateWithTarget(selectedTarget);
+
+            if (selectedTarget != null) {
+                List<Point> pathToTarget = orientedBfs.getPathTo(selectedTarget.bait.getX(), selectedTarget.bait.getY());
+                worldState.setCurrentPath(pathToTarget);
+
+                Move move = orientedBfs.firstMoveTo(selectedTarget.bait.getX(), selectedTarget.bait.getY());
+                if (move != Move.DO_NOTHING) {
+                    return move;
+                }
+            } else {
+                worldState.setCurrentPath(List.of());
+            }
+
+            return calculateFallbackMove(playerX, playerY, playerDirection);
+        }
     }
 
     /**
      * Selects the target to pursue, applying hysteresis to prevent oscillation.
-     *
-     * <p>Hysteresis ensures that the bot doesn't constantly switch between similar-valued targets.
-     * The new target must be significantly better (by {@link #TARGET_IMPROVEMENT_MULTIPLIER})
-     * before a switch occurs.</p>
      *
      * @param previousCandidate the currently targeted candidate, may be null
      * @param newCandidate the potential new target candidate, may be null
@@ -157,9 +168,6 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     /**
      * Determines whether to switch from the current target to a new candidate.
      *
-     * <p>For positive scores, requires the new score to exceed the current by the improvement
-     * multiplier. For non-positive scores, any improvement triggers a switch.</p>
-     *
      * @param currentScore the score of the current target
      * @param candidateScore the score of the potential new target
      * @return true if a target switch should occur, false otherwise
@@ -173,9 +181,6 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
 
     /**
      * Evaluates the current target to determine if it should remain the active target.
-     *
-     * <p>Only evaluates non-trap targets. If the current target is a trap or no longer
-     * exists, returns null.</p>
      *
      * @param availableBaits the list of currently visible baits
      * @return a candidate wrapper for the current target, or null if it's no longer valid
@@ -201,9 +206,6 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     /**
      * Finds the best non-trap bait to target from the available baits.
      *
-     * <p>This method explicitly filters out all trap baits and only considers
-     * Gems, Coffee, and Food as potential targets.</p>
-     *
      * @param availableBaits the list of currently visible baits
      * @return the best non-trap target candidate, or null if none are reachable
      */
@@ -213,6 +215,7 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
             if (bait.getType() == BaitType.TRAP) {
                 continue;
             }
+
             TargetCandidate candidate = evaluateTargetCandidate(bait);
             if (candidate != null && (bestCandidate == null || candidate.score > bestCandidate.score)) {
                 bestCandidate = candidate;
@@ -238,11 +241,9 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     /**
      * Calculates the attractiveness score for a bait considering its value and distance.
      *
-     * <p>The scoring formula is: score = baitValue - (distancePenalty × steps)</p>
-     *
      * @param bait the bait to score
      * @param distanceSteps the number of steps required to reach the bait
-     * @return the calculated score (can be negative for distant or low-value baits)
+     * @return the calculated score
      */
     private double calculateScore(Bait bait, int distanceSteps) {
         return bait.getScore() - (DISTANCE_PENALTY_PER_STEP * distanceSteps);
@@ -250,6 +251,9 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
 
     /**
      * Constructs a 2D boolean array marking all cells containing trap baits.
+     *
+     * <p>This method must be called while holding {@link #stateLock} so that the maze dimensions
+     * remain consistent with the current pathfinding state.</p>
      *
      * @param availableBaits the list of currently visible baits
      * @return a 2D array where true indicates a trap cell
@@ -263,12 +267,14 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
             if (bait.getType() != BaitType.TRAP) {
                 continue;
             }
+
             int x = bait.getX();
             int y = bait.getY();
             if (x >= 0 && y >= 0 && x < width && y < height) {
                 trapCells[x][y] = true;
             }
         }
+
         return trapCells;
     }
 
@@ -288,14 +294,6 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     /**
      * Calculates a fallback move when no viable target exists.
      *
-     * <p>The fallback strategy attempts to step forward if possible; otherwise, turns left
-     * to continue exploring. This exploratory behavior is used when:</p>
-     * <ul>
-     *     <li>No non-trap baits are visible</li>
-     *     <li>All non-trap baits are unreachable</li>
-     *     <li>The bot is surrounded by obstacles</li>
-     * </ul>
-     *
      * @param playerX the player's current x-coordinate
      * @param playerY the player's current y-coordinate
      * @param playerDirection the player's current facing direction
@@ -304,6 +302,7 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     private Move calculateFallbackMove(int playerX, int playerY, ViewDirection playerDirection) {
         int nextX = playerX + DirectionUtil.getDeltaX(playerDirection);
         int nextY = playerY + DirectionUtil.getDeltaY(playerDirection);
+
         if (mazeModel.isWalkable(nextX, nextY)) {
             return Move.STEP;
         }
@@ -312,18 +311,26 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
 
     @Override
     public void onBaitAppeared(@NotNull Bait bait) {
-        worldState.addBait(bait);
+        synchronized (stateLock) {
+            worldState.addBait(bait);
+        }
     }
 
     @Override
     public void onBaitVanished(@NotNull Bait bait) {
-        worldState.removeBait(bait);
-        worldState.clearTargetIfEquals(bait);
+        synchronized (stateLock) {
+            worldState.removeBait(bait);
+            worldState.clearTargetIfEquals(bait);
+        }
     }
 
     @Override
     public void onMazeReceived(int width, int height, @NotNull List<String> mazeLines) {
-        mazeModel.updateFromMaze(width, height, mazeLines);
+        synchronized (stateLock) {
+            mazeModel.updateFromMaze(width, height, mazeLines);
+            worldState.setCurrentPath(List.of());
+            worldState.setCurrentTarget(null, Double.NEGATIVE_INFINITY);
+        }
     }
 
     @Override

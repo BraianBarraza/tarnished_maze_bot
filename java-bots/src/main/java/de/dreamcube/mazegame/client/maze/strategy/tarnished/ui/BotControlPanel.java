@@ -22,7 +22,7 @@ import java.awt.Dimension;
  * </ul>
  *
  * <p>The panel automatically refreshes at 250ms intervals to reflect the current state
- * without requiring explicit event notification from the strategy.</p>
+ * using immutable snapshots.</p>
  */
 public final class BotControlPanel extends JPanel {
 
@@ -83,14 +83,13 @@ public final class BotControlPanel extends JPanel {
 
     /**
      * Updates the displayed labels to reflect the current world state.
-     *
-     * <p>This method is called periodically by the refresh timer. It updates the pause
-     * checkbox state, target coordinates, and score value based on the current world state.</p>
      */
     private void refreshLabels() {
-        pausedCheckBox.setSelected(worldState.isPaused());
+        WorldState.Snapshot snapshot = worldState.getSnapshot();
 
-        Bait currentTarget = worldState.getCurrentTarget();
+        pausedCheckBox.setSelected(snapshot.paused());
+
+        Bait currentTarget = snapshot.currentTarget();
         if (currentTarget == null) {
             targetLabel.setText("Target: (none)");
             scoreLabel.setText("Score: -");
@@ -98,6 +97,6 @@ public final class BotControlPanel extends JPanel {
         }
 
         targetLabel.setText(String.format("Target: (%d,%d)", currentTarget.getX(), currentTarget.getY()));
-        scoreLabel.setText(String.format("Score: %.1f", worldState.getCurrentTargetScoreValue()));
+        scoreLabel.setText(String.format("Score: %.1f", snapshot.currentTargetScoreValue()));
     }
 }

@@ -41,9 +41,6 @@ public final class TargetVisualization extends VisualizationComponent {
     /**
      * Paints the visualization overlay on the maze.
      *
-     * <p>If visualization is disabled or no target exists, nothing is drawn. Otherwise,
-     * the planned path is drawn first (behind), followed by the target marker (on top).</p>
-     *
      * @param graphics the graphics context to draw on
      */
     @Override
@@ -54,7 +51,8 @@ public final class TargetVisualization extends VisualizationComponent {
             return;
         }
 
-        Bait currentTarget = worldState.getCurrentTarget();
+        WorldState.Snapshot snapshot = worldState.getSnapshot();
+        Bait currentTarget = snapshot.currentTarget();
         if (currentTarget == null) {
             return;
         }
@@ -63,7 +61,7 @@ public final class TargetVisualization extends VisualizationComponent {
         Point offset = getOffset();
 
         Graphics2D graphics2D = (Graphics2D) graphics;
-        drawPlannedPath(graphics2D, offset, cellPixelSize);
+        drawPlannedPath(graphics2D, snapshot.currentPath(), offset, cellPixelSize);
         drawTargetMarker(graphics2D, currentTarget, offset, cellPixelSize);
     }
 
@@ -86,23 +84,20 @@ public final class TargetVisualization extends VisualizationComponent {
     /**
      * Draws lines connecting the cells in the planned path.
      *
-     * <p>Lines are drawn from the center of each cell to the center of the next cell.
-     * If the path contains fewer than two cells, nothing is drawn.</p>
-     *
      * @param graphics2D the graphics context to draw on
+     * @param path the path snapshot to draw
      * @param offset the maze rendering offset
      * @param cellPixelSize the size of one maze cell in pixels
      */
-    private void drawPlannedPath(Graphics2D graphics2D, Point offset, int cellPixelSize) {
-        List<Point> path = worldState.getCurrentPath();
-        if (path == null || path.size() < 2) {
+    private void drawPlannedPath(Graphics2D graphics2D, List<Point> path, Point offset, int cellPixelSize) {
+        if (path.size() < 2) {
             return;
         }
 
         graphics2D.setColor(PATH_COLOR);
         int halfCell = cellPixelSize / 2;
 
-        Point firstCell = path.getFirst();
+        Point firstCell = path.get(0);
         int previousPixelX = offset.x + firstCell.x * cellPixelSize + halfCell;
         int previousPixelY = offset.y + firstCell.y * cellPixelSize + halfCell;
 
