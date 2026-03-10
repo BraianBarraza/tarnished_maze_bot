@@ -8,6 +8,7 @@ import java.awt.Point;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.List;
 
@@ -39,18 +40,13 @@ import java.util.List;
  */
 public final class OrientedBfs {
 
-    private static final int DIRECTION_COUNT = 4;
-    private static final ViewDirection[] DIRECTIONS = {
-            ViewDirection.NORTH,
-            ViewDirection.EAST,
-            ViewDirection.SOUTH,
-            ViewDirection.WEST
-    };
+    private static final int DIRECTION_COUNT = ViewDirection.values().length;
 
     private final MazeModel mazeModel;
 
     private int mazeWidth;
     private int mazeHeight;
+    private int mazeCellCount;
 
     private int[] distanceByState;
     private Move[] firstMoveByState;
@@ -130,208 +126,153 @@ public final class OrientedBfs {
     /**
      * Computes oriented BFS distances and first moves from the given starting state.
      *
-     * <p>After this method completes, {@link #distanceTo(int, int)} and
-     * {@link #firstMoveTo(int, int)} will return results relative to this start state.</p>
-     *
      * @param startX the starting x-coordinate
      * @param startY the starting y-coordinate
      * @param startDirection the starting facing direction
+     * @param blockedCells optional bit set of temporarily blocked cells, may be null
      */
-    public void computeFrom(int startX, int startY, ViewDirection startDirection) {
-        computeFrom(startX, startY, startDirection, null);
-    }
-
-    /**
-     * Computes oriented BFS distances and first moves from the given starting state,
-     * optionally treating certain cells as blocked.
-     *
-     * <p>The blocked cells array allows temporary modification of the maze walkability
-     * without mutating the underlying {@link MazeModel}. This is useful for path planning
-     * that avoids known hazards.</p>
-     *
-     * @param startX the starting x-coordinate
-     * @param startY the starting y-coordinate
-     * @param startDirection the starting facing direction
-     * @param blockedCells a 2D array where true indicates blocked cells, or null to use
-     *                     only the maze model's walkability data
-     */
-    public void computeFrom(int startX, int startY, ViewDirection startDirection, boolean[][] blockedCells) {
+    public void computeFrom(int startX, int startY, ViewDirection startDirection, BitSet blockedCells) {
         mazeWidth = mazeModel.getWidth();
         mazeHeight = mazeModel.getHeight();
+        mazeCellCount = mazeWidth * mazeHeight;
 
-        int totalStateCount = mazeWidth * mazeHeight * DIRECTION_COUNT;
-        ensureStateArrayCapacity(totalStateCount);
-
-        resetStateArrays();
-
-        if (!mazeModel.isWalkable(startX, startY)) {
+        if (mazeCellCount <= 0) {
+            clearSearchResults();
             return;
         }
 
-        int startStateIndex = computeStateIndex(startX, startY, getDirectionIndex(startDirection));
-        distanceByState[startStateIndex] = 0;
+        int stateCount = mazeCellCount * DIRECTION_COUNT;
+        ensureCapacity(stateCount);
+
+        Arrays.fill(distanceByState, 0, stateCount, Integer.MAX_VALUE);
+        Arrays.fill(firstMoveByState, 0, stateCount, Move.DO_NOTHING);
+        Arrays.fill(previousStateByState, 0, stateCount, -1);
+
+        if (!isWithinMazeBounds(startX, startY) || !mazeModel.isWalkable(startX, startY)) {
+            return;
+        }
 
         ArrayDeque<Integer> queue = new ArrayDeque<>();
+        int startStateIndex = toStateIndex(startX, startY, startDirection.ordinal());
+
+        distanceByState[startStateIndex] = 0;
         queue.add(startStateIndex);
 
-        processSearchQueue(queue, blockedCells);
+        while (!queue.isEmpty()) {
+            int currentStateIndex = queue.removeFirst();
+            int currentDistance = distanceByState[currentStateIndex];
+
+            int currentCellIndex = currentStateIndex / DIRECTION_COUNT;
+            int currentDirectionIndex = currentStateIndex % DIRECTION_COUNT;
+            int currentX = currentCellIndex % mazeWidth;
+            int currentY = currentCellIndex / mazeWidth;
+
+            enqueueTurnTransition(queue, currentStateIndex, currentDistance, currentX, currentY,
+                    currentDirectionIndex, rotateLeft(currentDirectionIndex), Move.TURN_L);
+            enqueueTurnTransition(queue, currentStateIndex, currentDistance, currentX, currentY,
+                    currentDirectionIndex, rotateRight(currentDirectionIndex), Move.TURN_R);
+            enqueueStepTransition(queue, currentStateIndex, currentDistance, currentX, currentY,
+                    currentDirectionIndex, blockedCells);
+        }
     }
 
     /**
-     * Returns the sequence of maze cells forming the shortest path to the target.
-     *
-     * <p>The returned list begins with the starting cell and ends with the target cell.
-     * Only cells are included; the orientations at each cell are not part of the result.</p>
+     * Reconstructs the path to the target cell from the most recent search start position.
      *
      * @param targetX the x-coordinate of the target cell
      * @param targetY the y-coordinate of the target cell
-     * @return a list of points representing the path, or an empty list if the target
-     *         is unreachable or coordinates are out of bounds
+     * @return an immutable list of visited cells from start to target, or empty if unreachable
      */
     public List<Point> getPathTo(int targetX, int targetY) {
         if (!isSearchResultAvailable() || !isWithinMazeBounds(targetX, targetY)) {
             return List.of();
         }
 
-        int optimalStateIndex = findOptimalArrivalState(targetX, targetY);
-        if (optimalStateIndex == -1) {
+        int bestStateIndex = findBestArrivalStateIndex(targetX, targetY);
+        if (bestStateIndex < 0) {
             return List.of();
         }
 
-        return reconstructPath(optimalStateIndex);
-    }
+        ArrayList<Point> reversedPath = new ArrayList<>();
+        int currentStateIndex = bestStateIndex;
 
-    /**
-     * Processes the BFS queue, exploring all reachable states from the start position.
-     *
-     * @param queue the queue of state indices to process
-     * @param blockedCells optional array of blocked cells
-     */
-    private void processSearchQueue(ArrayDeque<Integer> queue, boolean[][] blockedCells) {
-        while (!queue.isEmpty()) {
-            int currentStateIndex = queue.removeFirst();
-
+        while (currentStateIndex >= 0) {
             int cellIndex = currentStateIndex / DIRECTION_COUNT;
-            int directionIndex = currentStateIndex % DIRECTION_COUNT;
             int x = cellIndex % mazeWidth;
             int y = cellIndex / mazeWidth;
 
-            int nextDistance = distanceByState[currentStateIndex] + 1;
-            Move inheritedFirstMove = firstMoveByState[currentStateIndex];
-            ViewDirection currentDirection = DIRECTIONS[directionIndex];
-
-            exploreRotations(queue, currentStateIndex, x, y, currentDirection, nextDistance, inheritedFirstMove);
-            exploreStepForward(queue, currentStateIndex, x, y, currentDirection, directionIndex,
-                    nextDistance, inheritedFirstMove, blockedCells);
-        }
-    }
-
-    /**
-     * Explores left and right rotation transitions from the current state.
-     *
-     * @param queue the BFS queue
-     * @param currentStateIndex the current state index
-     * @param x the current x-coordinate
-     * @param y the current y-coordinate
-     * @param currentDirection the current facing direction
-     * @param nextDistance the distance for successor states
-     * @param inheritedFirstMove the first move to inherit for successor states
-     */
-    private void exploreRotations(ArrayDeque<Integer> queue, int currentStateIndex, int x, int y,
-                                  ViewDirection currentDirection, int nextDistance, Move inheritedFirstMove) {
-        relaxNeighborState(queue, currentStateIndex, x, y,
-                getDirectionIndex(rotateLeft(currentDirection)),
-                nextDistance, inheritedFirstMove, Move.TURN_L);
-
-        relaxNeighborState(queue, currentStateIndex, x, y,
-                getDirectionIndex(rotateRight(currentDirection)),
-                nextDistance, inheritedFirstMove, Move.TURN_R);
-    }
-
-    /**
-     * Explores the step-forward transition from the current state.
-     *
-     * @param queue the BFS queue
-     * @param currentStateIndex the current state index
-     * @param x the current x-coordinate
-     * @param y the current y-coordinate
-     * @param currentDirection the current facing direction
-     * @param directionIndex the index of the current direction
-     * @param nextDistance the distance for the successor state
-     * @param inheritedFirstMove the first move to inherit for the successor state
-     * @param blockedCells optional array of blocked cells
-     */
-    private void exploreStepForward(ArrayDeque<Integer> queue, int currentStateIndex, int x, int y,
-                                    ViewDirection currentDirection, int directionIndex,
-                                    int nextDistance, Move inheritedFirstMove, boolean[][] blockedCells) {
-        int nextX = x + DirectionUtil.getDeltaX(currentDirection);
-        int nextY = y + DirectionUtil.getDeltaY(currentDirection);
-
-        if (mazeModel.isWalkable(nextX, nextY) && !isBlocked(blockedCells, nextX, nextY)) {
-            int stepStateIndex = computeStateIndex(nextX, nextY, directionIndex);
-
-            if (distanceByState[stepStateIndex] == Integer.MAX_VALUE) {
-                distanceByState[stepStateIndex] = nextDistance;
-                firstMoveByState[stepStateIndex] = determineFirstMove(currentStateIndex, inheritedFirstMove, Move.STEP);
-                previousStateByState[stepStateIndex] = currentStateIndex;
-                queue.add(stepStateIndex);
+            if (reversedPath.isEmpty()
+                    || reversedPath.get(reversedPath.size() - 1).x != x
+                    || reversedPath.get(reversedPath.size() - 1).y != y) {
+                reversedPath.add(new Point(x, y));
             }
+
+            currentStateIndex = previousStateByState[currentStateIndex];
         }
+
+        Collections.reverse(reversedPath);
+        return List.copyOf(reversedPath);
     }
 
-    /**
-     * Attempts to relax a neighbor state during BFS exploration.
-     *
-     * <p>If the neighbor state has not yet been visited, it is added to the queue
-     * with updated distance and first-move information.</p>
-     *
-     * @param queue the BFS queue
-     * @param currentStateIndex the current state index
-     * @param x the x-coordinate (unchanged for rotations)
-     * @param y the y-coordinate (unchanged for rotations)
-     * @param neighborDirectionIndex the direction index of the neighbor state
-     * @param nextDistance the distance value for the neighbor
-     * @param inheritedFirstMove the first move to inherit if not at start
-     * @param transitionMove the move that transitions to this neighbor
-     */
-    private void relaxNeighborState(ArrayDeque<Integer> queue, int currentStateIndex,
-                                    int x, int y, int neighborDirectionIndex,
-                                    int nextDistance, Move inheritedFirstMove, Move transitionMove) {
-        int neighborStateIndex = computeStateIndex(x, y, neighborDirectionIndex);
+    private void enqueueTurnTransition(ArrayDeque<Integer> queue,
+                                       int currentStateIndex,
+                                       int currentDistance,
+                                       int currentX,
+                                       int currentY,
+                                       int currentDirectionIndex,
+                                       int nextDirectionIndex,
+                                       Move transitionMove) {
+        int nextStateIndex = toStateIndex(currentX, currentY, nextDirectionIndex);
+        relaxTransition(queue, currentStateIndex, currentDistance, currentDirectionIndex, nextStateIndex, transitionMove);
+    }
 
-        if (distanceByState[neighborStateIndex] != Integer.MAX_VALUE) {
+    private void enqueueStepTransition(ArrayDeque<Integer> queue,
+                                       int currentStateIndex,
+                                       int currentDistance,
+                                       int currentX,
+                                       int currentY,
+                                       int currentDirectionIndex,
+                                       BitSet blockedCells) {
+        ViewDirection direction = ViewDirection.values()[currentDirectionIndex];
+        int nextX = currentX + deltaX(direction);
+        int nextY = currentY + deltaY(direction);
+
+        if (!isWithinMazeBounds(nextX, nextY) || !mazeModel.isWalkable(nextX, nextY)) {
             return;
         }
 
-        distanceByState[neighborStateIndex] = nextDistance;
-        firstMoveByState[neighborStateIndex] = determineFirstMove(currentStateIndex, inheritedFirstMove, transitionMove);
-        previousStateByState[neighborStateIndex] = currentStateIndex;
-        queue.add(neighborStateIndex);
+        int nextCellIndex = toCellIndex(nextX, nextY);
+        if (blockedCells != null && blockedCells.get(nextCellIndex)) {
+            return;
+        }
+
+        int nextStateIndex = toStateIndex(nextX, nextY, currentDirectionIndex);
+        relaxTransition(queue, currentStateIndex, currentDistance, currentDirectionIndex, nextStateIndex, Move.STEP);
     }
 
-    /**
-     * Determines the first move for a successor state based on distance from start.
-     *
-     * @param currentStateIndex the current state index
-     * @param inheritedFirstMove the first move from the current state
-     * @param transitionMove the move transitioning to the successor
-     * @return the transition move if at start (distance 0), otherwise the inherited first move
-     */
-    private Move determineFirstMove(int currentStateIndex, Move inheritedFirstMove, Move transitionMove) {
-        return distanceByState[currentStateIndex] == 0 ? transitionMove : inheritedFirstMove;
+    private void relaxTransition(ArrayDeque<Integer> queue,
+                                 int currentStateIndex,
+                                 int currentDistance,
+                                 int currentDirectionIndex,
+                                 int nextStateIndex,
+                                 Move transitionMove) {
+        if (distanceByState[nextStateIndex] != Integer.MAX_VALUE) {
+            return;
+        }
+
+        distanceByState[nextStateIndex] = currentDistance + 1;
+        previousStateByState[nextStateIndex] = currentStateIndex;
+        firstMoveByState[nextStateIndex] = (currentDistance == 0)
+                ? transitionMove
+                : firstMoveByState[currentStateIndex];
+
+        queue.addLast(nextStateIndex);
     }
 
-    /**
-     * Finds the state index at the target cell with minimum distance across all directions.
-     *
-     * @param targetX the target x-coordinate
-     * @param targetY the target y-coordinate
-     * @return the optimal state index, or -1 if the target is unreachable
-     */
-    private int findOptimalArrivalState(int targetX, int targetY) {
+    private int findBestArrivalStateIndex(int targetX, int targetY) {
         int baseStateIndex = computeBaseStateIndex(targetX, targetY);
+        int bestStateIndex = -1;
         int minimumDistance = Integer.MAX_VALUE;
-        int optimalStateIndex = -1;
 
         for (int directionIndex = 0; directionIndex < DIRECTION_COUNT; directionIndex++) {
             int stateIndex = baseStateIndex + directionIndex;
@@ -339,201 +280,71 @@ public final class OrientedBfs {
 
             if (stateDistance < minimumDistance) {
                 minimumDistance = stateDistance;
-                optimalStateIndex = stateIndex;
+                bestStateIndex = stateIndex;
             }
         }
 
-        return minimumDistance == Integer.MAX_VALUE ? -1 : optimalStateIndex;
+        return minimumDistance == Integer.MAX_VALUE ? -1 : bestStateIndex;
     }
 
-    /**
-     * Reconstructs the path from start to the given state by following predecessor links.
-     *
-     * @param targetStateIndex the ending state index
-     * @return a list of points from start to target
-     */
-    private List<Point> reconstructPath(int targetStateIndex) {
-        ArrayList<Point> reversedPath = new ArrayList<>();
-        int currentStateIndex = targetStateIndex;
-        int lastCellX = Integer.MIN_VALUE;
-        int lastCellY = Integer.MIN_VALUE;
-
-        while (currentStateIndex >= 0) {
-            int cellIndex = currentStateIndex / DIRECTION_COUNT;
-            int cellX = cellIndex % mazeWidth;
-            int cellY = cellIndex / mazeWidth;
-
-            if (cellX != lastCellX || cellY != lastCellY) {
-                reversedPath.add(new Point(cellX, cellY));
-                lastCellX = cellX;
-                lastCellY = cellY;
-            }
-
-            currentStateIndex = previousStateByState[currentStateIndex];
+    private void ensureCapacity(int stateCount) {
+        if (distanceByState == null || distanceByState.length < stateCount) {
+            distanceByState = new int[stateCount];
+            firstMoveByState = new Move[stateCount];
+            previousStateByState = new int[stateCount];
         }
-
-        Collections.reverse(reversedPath);
-        return reversedPath;
     }
 
-    /**
-     * Checks if search results are available for querying.
-     *
-     * @return true if a search has been performed and results are available
-     */
+    private void clearSearchResults() {
+        mazeWidth = 0;
+        mazeHeight = 0;
+        mazeCellCount = 0;
+        distanceByState = null;
+        firstMoveByState = null;
+        previousStateByState = null;
+    }
+
     private boolean isSearchResultAvailable() {
-        return distanceByState != null && firstMoveByState != null && previousStateByState != null;
+        return distanceByState != null && mazeWidth > 0 && mazeHeight > 0;
     }
 
-    /**
-     * Ensures the state arrays have sufficient capacity for the given state count.
-     *
-     * @param totalStateCount the required capacity
-     */
-    private void ensureStateArrayCapacity(int totalStateCount) {
-        if (distanceByState != null && distanceByState.length == totalStateCount) {
-            return;
-        }
-        distanceByState = new int[totalStateCount];
-        firstMoveByState = new Move[totalStateCount];
-        previousStateByState = new int[totalStateCount];
-    }
-
-    /**
-     * Resets all state arrays to their initial unvisited values.
-     */
-    private void resetStateArrays() {
-        Arrays.fill(distanceByState, Integer.MAX_VALUE);
-        Arrays.fill(firstMoveByState, Move.DO_NOTHING);
-        Arrays.fill(previousStateByState, -1);
-    }
-
-    /**
-     * Computes the state index for a given cell and direction.
-     *
-     * @param x the x-coordinate
-     * @param y the y-coordinate
-     * @param directionIndex the direction index (0-3)
-     * @return the flattened state index
-     */
-    private int computeStateIndex(int x, int y, int directionIndex) {
-        return ((y * mazeWidth) + x) * DIRECTION_COUNT + directionIndex;
-    }
-
-    /**
-     * Computes the base state index for a given cell (direction-independent).
-     *
-     * @param x the x-coordinate
-     * @param y the y-coordinate
-     * @return the base state index (direction 0)
-     */
-    private int computeBaseStateIndex(int x, int y) {
-        return ((y * mazeWidth) + x) * DIRECTION_COUNT;
-    }
-
-    /**
-     * Checks if coordinates are within maze bounds.
-     *
-     * @param x the x-coordinate to check
-     * @param y the y-coordinate to check
-     * @return true if coordinates are valid
-     */
     private boolean isWithinMazeBounds(int x, int y) {
         return x >= 0 && y >= 0 && x < mazeWidth && y < mazeHeight;
     }
 
-    /**
-     * Maps a view direction to its integer index.
-     *
-     * @param direction the view direction
-     * @return the corresponding index (0=NORTH, 1=EAST, 2=SOUTH, 3=WEST)
-     */
-    private int getDirectionIndex(ViewDirection direction) {
+    private int toCellIndex(int x, int y) {
+        return (y * mazeWidth) + x;
+    }
+
+    private int computeBaseStateIndex(int x, int y) {
+        return toCellIndex(x, y) * DIRECTION_COUNT;
+    }
+
+    private int toStateIndex(int x, int y, int directionIndex) {
+        return computeBaseStateIndex(x, y) + directionIndex;
+    }
+
+    private int rotateLeft(int directionIndex) {
+        return (directionIndex + DIRECTION_COUNT - 1) % DIRECTION_COUNT;
+    }
+
+    private int rotateRight(int directionIndex) {
+        return (directionIndex + 1) % DIRECTION_COUNT;
+    }
+
+    private int deltaX(ViewDirection direction) {
         return switch (direction) {
-            case NORTH -> 0;
+            case NORTH, SOUTH -> 0;
             case EAST -> 1;
-            case SOUTH -> 2;
-            case WEST -> 3;
+            case WEST -> -1;
         };
     }
 
-    /**
-     * Rotates a direction 90 degrees counterclockwise.
-     *
-     * @param direction the current direction
-     * @return the direction after rotating left
-     */
-    private ViewDirection rotateLeft(ViewDirection direction) {
+    private int deltaY(ViewDirection direction) {
         return switch (direction) {
-            case NORTH -> ViewDirection.WEST;
-            case WEST -> ViewDirection.SOUTH;
-            case SOUTH -> ViewDirection.EAST;
-            case EAST -> ViewDirection.NORTH;
+            case NORTH -> -1;
+            case EAST, WEST -> 0;
+            case SOUTH -> 1;
         };
-    }
-
-    /**
-     * Rotates a direction 90 degrees clockwise.
-     *
-     * @param direction the current direction
-     * @return the direction after rotating right
-     */
-    private ViewDirection rotateRight(ViewDirection direction) {
-        return switch (direction) {
-            case NORTH -> ViewDirection.EAST;
-            case EAST -> ViewDirection.SOUTH;
-            case SOUTH -> ViewDirection.WEST;
-            case WEST -> ViewDirection.NORTH;
-        };
-    }
-
-    /**
-     * Checks if a cell is blocked according to the provided blocked cells array.
-     *
-     * @param blockedCells the array of blocked cells, or null
-     * @param x the x-coordinate to check
-     * @param y the y-coordinate to check
-     * @return true if the cell is blocked
-     */
-    private boolean isBlocked(boolean[][] blockedCells, int x, int y) {
-        return blockedCells != null
-                && x >= 0 && y >= 0
-                && x < blockedCells.length
-                && y < blockedCells[x].length
-                && blockedCells[x][y];
-    }
-
-    /**
-     * Utility class for direction-related coordinate calculations.
-     */
-    private static final class DirectionUtil {
-
-        /**
-         * Returns the x-coordinate change when stepping in the given direction.
-         *
-         * @param direction the facing direction
-         * @return 1 for EAST, -1 for WEST, 0 otherwise
-         */
-        static int getDeltaX(ViewDirection direction) {
-            return switch (direction) {
-                case NORTH, SOUTH -> 0;
-                case EAST -> 1;
-                case WEST -> -1;
-            };
-        }
-
-        /**
-         * Returns the y-coordinate change when stepping in the given direction.
-         *
-         * @param direction the facing direction
-         * @return -1 for NORTH, 1 for SOUTH, 0 otherwise
-         */
-        static int getDeltaY(ViewDirection direction) {
-            return switch (direction) {
-                case NORTH -> -1;
-                case EAST, WEST -> 0;
-                case SOUTH -> 1;
-            };
-        }
     }
 }

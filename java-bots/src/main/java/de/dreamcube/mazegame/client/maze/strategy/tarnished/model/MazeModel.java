@@ -1,14 +1,14 @@
 package de.dreamcube.mazegame.client.maze.strategy.tarnished.model;
 
+import java.util.BitSet;
 import java.util.List;
 import java.util.Objects;
 
 /**
- * Represents the static structure of the maze as a grid of walkable and non-walkable cells.
+ * Represents the static maze layout using a compact one-dimensional BitSet.
  *
- * <p>The maze is received from the server as a list of text lines, where each character
- * represents a cell. Currently, only the dot character ('.') is considered walkable;
- * all other characters represent obstacles or walls.</p>
+ * <p>Each cell is mapped to a linear index using {@code index = y * width + x}.
+ * A set bit indicates that the corresponding cell is walkable.</p>
  *
  * <p>All public access is synchronized so that callbacks updating the maze and strategy logic
  * reading it cannot observe partially published state.</p>
@@ -17,7 +17,7 @@ public final class MazeModel {
 
     private int width;
     private int height;
-    private boolean[][] walkable;
+    private BitSet walkableCells;
 
     /**
      * Returns the current maze width.
@@ -38,12 +38,21 @@ public final class MazeModel {
     }
 
     /**
+     * Returns the total number of cells in the maze.
+     *
+     * @return width * height, or 0 if the maze is not initialized
+     */
+    public synchronized int getCellCount() {
+        return width * height;
+    }
+
+    /**
      * Checks if the maze has been initialized with valid dimensions.
      *
      * @return true if the maze has been received and has positive dimensions
      */
     public synchronized boolean hasMaze() {
-        return walkable != null && width > 0 && height > 0;
+        return walkableCells != null && width > 0 && height > 0;
     }
 
     /**
@@ -58,6 +67,23 @@ public final class MazeModel {
     }
 
     /**
+     * Converts two-dimensional maze coordinates to a linear index.
+     *
+     * @param x the x-coordinate
+     * @param y the y-coordinate
+     * @return the linear index
+     * @throws IndexOutOfBoundsException if the coordinates are outside the maze bounds
+     */
+    public synchronized int toIndex(int x, int y) {
+        if (!isWithinBounds(x, y)) {
+            throw new IndexOutOfBoundsException(
+                    "Coordinates out of bounds: (" + x + "," + y + ") for maze " + width + "x" + height
+            );
+        }
+        return (y * width) + x;
+    }
+
+    /**
      * Checks if a cell can be traversed by the bot.
      *
      * @param x the x-coordinate of the cell
@@ -65,7 +91,17 @@ public final class MazeModel {
      * @return true if the cell is walkable, false otherwise
      */
     public synchronized boolean isWalkable(int x, int y) {
-        return isWithinBounds(x, y) && walkable != null && walkable[x][y];
+        return isWithinBounds(x, y) && walkableCells != null && walkableCells.get((y * width) + x);
+    }
+
+    /**
+     * Checks if a cell represented by its linear index is walkable.
+     *
+     * @param cellIndex the linear cell index
+     * @return true if the indexed cell is walkable, false otherwise
+     */
+    public synchronized boolean isWalkableIndex(int cellIndex) {
+        return walkableCells != null && cellIndex >= 0 && cellIndex < width * height && walkableCells.get(cellIndex);
     }
 
     /**
@@ -81,7 +117,7 @@ public final class MazeModel {
             return;
         }
 
-        boolean[][] newWalkable = new boolean[width][height];
+        BitSet newWalkableCells = new BitSet(width * height);
 
         int rowCount = Math.min(height, lines.size());
         for (int y = 0; y < rowCount; y++) {
@@ -89,13 +125,15 @@ public final class MazeModel {
             int columnCount = Math.min(width, line.length());
 
             for (int x = 0; x < columnCount; x++) {
-                newWalkable[x][y] = (line.charAt(x) == '.');
+                if (line.charAt(x) == '.') {
+                    newWalkableCells.set((y * width) + x);
+                }
             }
         }
 
         this.width = width;
         this.height = height;
-        this.walkable = newWalkable;
+        this.walkableCells = newWalkableCells;
     }
 
     /**
@@ -104,6 +142,6 @@ public final class MazeModel {
     private void clearMaze() {
         width = 0;
         height = 0;
-        walkable = null;
+        walkableCells = null;
     }
 }

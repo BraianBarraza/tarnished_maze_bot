@@ -19,6 +19,7 @@ import org.jetbrains.annotations.NotNull;
 
 import javax.swing.JPanel;
 import java.awt.Point;
+import java.util.BitSet;
 import java.util.List;
 
 /**
@@ -68,6 +69,11 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     private TargetVisualization visualization;
 
     /**
+     * Reusable buffer for temporarily blocked trap cells.
+     */
+    private BitSet trapCellsBuffer;
+
+    /**
      * Initializes the strategy components including maze model, world state, pathfinding,
      * control panel, and visualization.
      */
@@ -78,6 +84,7 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
         orientedBfs = new OrientedBfs(mazeModel);
         controlPanel = new BotControlPanel(worldState);
         visualization = new TargetVisualization(worldState);
+        trapCellsBuffer = new BitSet();
     }
 
     /**
@@ -115,7 +122,7 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
 
             List<Bait> availableBaits = worldState.getActiveBaitsSnapshot();
 
-            boolean[][] trapCells = buildTrapCellMap(availableBaits);
+            BitSet trapCells = buildTrapCellBitSet(availableBaits);
             orientedBfs.computeFrom(playerX, playerY, playerDirection, trapCells);
 
             TargetCandidate previousCandidate = evaluatePreviousTarget(availableBaits);
@@ -250,18 +257,13 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     }
 
     /**
-     * Constructs a 2D boolean array marking all cells containing trap baits.
-     *
-     * <p>This method must be called while holding {@link #stateLock} so that the maze dimensions
-     * remain consistent with the current pathfinding state.</p>
+     * Rebuilds the reusable trap cell buffer using one-dimensional cell indices.
      *
      * @param availableBaits the list of currently visible baits
-     * @return a 2D array where true indicates a trap cell
+     * @return the reusable bit set marking trap cells as blocked
      */
-    private boolean[][] buildTrapCellMap(List<Bait> availableBaits) {
-        int width = mazeModel.getWidth();
-        int height = mazeModel.getHeight();
-        boolean[][] trapCells = new boolean[width][height];
+    private BitSet buildTrapCellBitSet(List<Bait> availableBaits) {
+        trapCellsBuffer.clear();
 
         for (Bait bait : availableBaits) {
             if (bait.getType() != BaitType.TRAP) {
@@ -270,12 +272,12 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
 
             int x = bait.getX();
             int y = bait.getY();
-            if (x >= 0 && y >= 0 && x < width && y < height) {
-                trapCells[x][y] = true;
+            if (mazeModel.isWithinBounds(x, y)) {
+                trapCellsBuffer.set(mazeModel.toIndex(x, y));
             }
         }
 
-        return trapCells;
+        return trapCellsBuffer;
     }
 
     /**
@@ -328,6 +330,7 @@ public class BfsScoringStrategy extends Strategy implements BaitEventListener, M
     public void onMazeReceived(int width, int height, @NotNull List<String> mazeLines) {
         synchronized (stateLock) {
             mazeModel.updateFromMaze(width, height, mazeLines);
+            trapCellsBuffer.clear();
             worldState.setCurrentPath(List.of());
             worldState.setCurrentTarget(null, Double.NEGATIVE_INFINITY);
         }
