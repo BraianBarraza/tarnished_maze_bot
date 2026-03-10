@@ -13,42 +13,22 @@ import java.awt.RenderingHints;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Visualizes bot-related information on top of the maze.
+ * Visualization bound to a single immutable render state.
  */
 public final class BotVisualization extends VisualizationComponent {
 
-    /** Target cell in maze coordinates. If null, nothing is highlighted. */
-    private volatile @Nullable Point targetCell;
+    private final AtomicReference<RenderState> renderState = new AtomicReference<>(RenderState.empty());
 
-    /** Planned path in maze coordinates (optional). */
-    private volatile @NotNull List<Point> plannedPath = Collections.emptyList();
-
-    /** Optional label rendered near the target. */
-    private volatile @Nullable String targetLabel;
-
-    /** Sets the current target to be highlighted. */
-    public void setTarget(int x, int y, @Nullable String label) {
-        this.targetCell = new Point(x, y);
-        this.targetLabel = label;
+    public void render(@Nullable Point target, @Nullable String label, @Nullable List<Point> path) {
+        renderState.set(RenderState.of(target, label, path));
         repaint();
     }
 
-    /** Clears the current target highlight. */
-    public void clearTarget() {
-        this.targetCell = null;
-        this.targetLabel = null;
-        repaint();
-    }
-
-    /** Sets a path to be drawn (maze coordinates). The list is copied defensively. */
-    public void setPlannedPath(@Nullable List<Point> path) {
-        if (path == null || path.isEmpty()) {
-            this.plannedPath = Collections.emptyList();
-        } else {
-            this.plannedPath = Collections.unmodifiableList(new ArrayList<>(path));
-        }
+    public void clear() {
+        renderState.set(RenderState.empty());
         repaint();
     }
 
@@ -56,46 +36,49 @@ public final class BotVisualization extends VisualizationComponent {
     protected void paintComponent(@NotNull Graphics g) {
         super.paintComponent(g);
 
-        if (!getVisualizationEnabled()) return;
+        if (!getVisualizationEnabled()) {
+            return;
+        }
 
-        final Point target = this.targetCell;
-        final List<Point> path = this.plannedPath;
-        if (target == null && path.isEmpty()) return;
+        RenderState state = renderState.get();
+        if (state.target() == null && state.path().isEmpty()) {
+            return;
+        }
 
         final int cellSize = Math.max(2, getZoom());
-        final Point off = getOffset();
+        final Point offset = getOffset();
 
         Graphics2D g2 = (Graphics2D) g.create();
         try {
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
 
             Integer selectedPlayerId = getSelectedPlayerId();
-            Color base = (selectedPlayerId != null) ? getPlayerColor(selectedPlayerId) : null;
-            if (base == null) base = Color.MAGENTA;
+            Color base = selectedPlayerId != null ? getPlayerColor(selectedPlayerId) : null;
+            if (base == null) {
+                base = Color.MAGENTA;
+            }
 
-            // 1) Path
-            if (path.size() >= 2) {
+            if (state.path().size() >= 2) {
                 g2.setColor(withAlpha(base, 120));
-                float stroke = Math.max(1f, cellSize / 6f);
-                g2.setStroke(new BasicStroke(stroke, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                g2.setStroke(new BasicStroke(Math.max(1f, cellSize / 6f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
 
-                Point prev = path.get(0);
-                for (int i = 1; i < path.size(); i++) {
-                    Point cur = path.get(i);
+                Point previous = state.path().get(0);
+                for (int i = 1; i < state.path().size(); i++) {
+                    Point current = state.path().get(i);
                     g2.drawLine(
-                            toScreenCenterX(prev.x, off.x, cellSize),
-                            toScreenCenterY(prev.y, off.y, cellSize),
-                            toScreenCenterX(cur.x, off.x, cellSize),
-                            toScreenCenterY(cur.y, off.y, cellSize)
+                            toScreenCenterX(previous.x, offset.x, cellSize),
+                            toScreenCenterY(previous.y, offset.y, cellSize),
+                            toScreenCenterX(current.x, offset.x, cellSize),
+                            toScreenCenterY(current.y, offset.y, cellSize)
                     );
-                    prev = cur;
+                    previous = current;
                 }
             }
 
-            // 2) Target
+            Point target = state.target();
             if (target != null) {
-                int sx = toScreenX(target.x, off.x, cellSize);
-                int sy = toScreenY(target.y, off.y, cellSize);
+                int sx = toScreenX(target.x, offset.x, cellSize);
+                int sy = toScreenY(target.y, offset.y, cellSize);
 
                 g2.setColor(base);
                 float ringStroke = Math.max(2f, cellSize / 4f);
@@ -104,20 +87,25 @@ public final class BotVisualization extends VisualizationComponent {
 
                 int cx = sx + cellSize / 2;
                 int cy = sy + cellSize / 2;
-                int r = Math.max(2, cellSize / 2);
+                int radius = Math.max(2, cellSize / 2);
 
                 g2.setStroke(new BasicStroke(Math.max(1f, ringStroke / 2f)));
-                g2.drawLine(cx - r, cy, cx + r, cy);
-                g2.drawLine(cx, cy - r, cx, cy + r);
+                g2.drawLine(cx - radius, cy, cx + radius, cy);
+                g2.drawLine(cx, cy - radius, cx, cy + radius);
 
-                String label = this.targetLabel;
-                if (label != null && !label.isBlank()) {
+                if (state.label() != null && !state.label().isBlank()) {
                     g2.setColor(withAlpha(Color.BLACK, 160));
-                    g2.fillRoundRect(sx + cellSize + 2, sy - 2,
-                            Math.max(30, label.length() * 7 + 10), cellSize + 4, 8, 8);
+                    g2.fillRoundRect(
+                            sx + cellSize + 2,
+                            sy - 2,
+                            Math.max(30, state.label().length() * 7 + 10),
+                            cellSize + 4,
+                            8,
+                            8
+                    );
 
                     g2.setColor(Color.WHITE);
-                    g2.drawString(label, sx + cellSize + 8, sy + cellSize - 6);
+                    g2.drawString(state.label(), sx + cellSize + 8, sy + cellSize - 6);
                 }
             }
         } finally {
@@ -141,8 +129,32 @@ public final class BotVisualization extends VisualizationComponent {
         return toScreenY(mazeY, offsetY, cellSize) + (cellSize / 2);
     }
 
-    private static Color withAlpha(Color c, int alpha) {
+    private static Color withAlpha(Color color, int alpha) {
         alpha = Math.max(0, Math.min(255, alpha));
-        return new Color(c.getRed(), c.getGreen(), c.getBlue(), alpha);
+        return new Color(color.getRed(), color.getGreen(), color.getBlue(), alpha);
+    }
+
+    private record RenderState(@Nullable Point target, @Nullable String label, @NotNull List<Point> path) {
+
+        private static final RenderState EMPTY = new RenderState(null, null, List.of());
+
+        private static @NotNull RenderState empty() {
+            return EMPTY;
+        }
+
+        private static @NotNull RenderState of(@Nullable Point target, @Nullable String label, @Nullable List<Point> path) {
+            Point targetCopy = target == null ? null : new Point(target);
+            List<Point> pathCopy;
+            if (path == null || path.isEmpty()) {
+                pathCopy = List.of();
+            } else {
+                ArrayList<Point> copy = new ArrayList<>(path.size());
+                for (Point point : path) {
+                    copy.add(new Point(point));
+                }
+                pathCopy = Collections.unmodifiableList(copy);
+            }
+            return new RenderState(targetCopy, label, pathCopy);
+        }
     }
 }

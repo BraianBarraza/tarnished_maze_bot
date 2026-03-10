@@ -1,380 +1,532 @@
 package de.dreamcube.mazegame.client.maze.strategy.malenia.core;
 
 import de.dreamcube.mazegame.client.maze.Bait;
+import de.dreamcube.mazegame.client.maze.PlayerSnapshot;
 import de.dreamcube.mazegame.client.maze.strategy.Move;
-import de.dreamcube.mazegame.client.maze.strategy.Strategy;
+import de.dreamcube.mazegame.common.maze.BaitType;
 import de.dreamcube.mazegame.common.maze.ViewDirection;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.awt.Point;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.PriorityQueue;
-import java.util.concurrent.ConcurrentHashMap;
 
 import static de.dreamcube.mazegame.client.maze.BaitKt.combineIntsToLong;
 
 /**
- * Core runtime for the "Malenia" bot.
- * Bundles minimal state + planning logic to keep package/class count low (KISS/YAGNI).
+ * Decision engine for the Malenia bot.
+ *
+ * <p>The engine is intentionally state-light: it plans from an immutable world snapshot and returns
+ * the next move plus a small target lock for short-term hysteresis. This keeps the thread-safety
+ * story simple and avoids mixing client reads with event-driven state.</p>
  */
 public final class MaleniaEngine {
 
-    /** Default tuning values. */
     private static final PlannerConfig DEFAULT_CONFIG = new PlannerConfig(
-            40,    // maxDepth
-            6000,  // maxExpansions
-            24,    // candidateBaits
-            6.0,   // moveCost
-            250.0  // trapStepPenalty
+            10.0,  // distancePenaltyPerStep
+            40.0,  // trapTraversalPenalty
+            60.0,  // contestedTargetPenalty
+            1.18,  // targetSwitchMultiplier
+            18.0,  // targetSwitchMargin
+            3      // targetCommitmentTicks
     );
 
-    /** Server uses -128 for traps. Used when simulating a trap step. */
-    private static final int TRAP_SCORE = -128;
-
-    private final MazeModel maze = new MazeModel();
-    private final ConcurrentHashMap<Long, Bait> baits = new ConcurrentHashMap<>();
-    private final ClientAccess clientAccess = new ClientAccess();
-    private final RewardPlanner planner;
+    private final PlannerConfig config;
 
     public MaleniaEngine() {
         this(DEFAULT_CONFIG);
     }
 
     public MaleniaEngine(@NotNull PlannerConfig config) {
-        this.planner = new RewardPlanner(config);
+        this.config = config;
     }
 
-    public void updateMaze(int width, int height, @NotNull List<String> mazeLines) {
-        maze.updateFromMazeLines(width, height, mazeLines);
-    }
-
-    public void onBaitAppeared(@NotNull Bait bait) {
-        baits.put(combineIntsToLong(bait.getX(), bait.getY()), bait);
-    }
-
-    public void onBaitVanished(@NotNull Bait bait) {
-        baits.remove(combineIntsToLong(bait.getX(), bait.getY()));
-    }
-
-    public @Nullable Decision nextDecision(@NotNull Strategy strategy, @NotNull String fallbackNick) {
-        if (!maze.isReady()) return null;
-
-        BotState me = clientAccess.readOwnState(strategy, fallbackNick);
-        if (me == null) return null;
-
-        // Defensive fallback: if event tracking didn't deliver baits yet, pull them once.
-        if (baits.isEmpty()) {
-            clientAccess.refreshBaits(strategy, baits);
+    public @Nullable Decision nextDecision(@NotNull WorldSnapshot world, @Nullable TargetLock previousLock) {
+        MazeSnapshot maze = world.maze();
+        PlayerState self = world.self();
+        if (!maze.isReady() || self == null || !maze.isWalkable(self.x(), self.y())) {
+            return null;
         }
 
-        ArrayList<Bait> baitSnapshot = new ArrayList<>(baits.values());
-        if (baitSnapshot.isEmpty()) return null;
+        boolean[] occupied = buildOccupiedGrid(maze, world.others());
+        boolean[] danger = buildDangerGrid(maze, world.others());
+        boolean[] trapCells = buildTrapGrid(maze, world.baits());
 
-        List<PlayerState> others = clientAccess.readOtherPlayers(strategy, fallbackNick, me);
-        boolean[] occupied = others.isEmpty() ? null : buildOccupiedGrid(maze, others);
+        OrientedSearch safeSearch = new OrientedSearch(maze);
+        safeSearch.computeFrom(self.x(), self.y(), self.direction(), mergeBlocked(danger, trapCells));
 
-        RewardPlanner.PlanResult plan = planner.plan(new RewardPlanner.PlanRequest(maze, baitSnapshot, me, occupied));
-        if (plan == null || plan.firstMove() == null) return null;
+        TargetCandidate safePrevious = evaluateLockedTarget(previousLock, world, safeSearch, trapCells);
+        TargetCandidate safeBest = findBestCandidate(world, safeSearch, trapCells, false);
+        Selection safeSelection = selectCandidate(safePrevious, safeBest, previousLock);
 
-        RewardPlanner.PlanResult picked = plan;
+        if (safeSelection != null) {
+            return buildDecision(world.version(), safeSelection, self, maze, occupied);
+        }
 
-        // If another player is very close and approaching our target in a straight line,
-        // switch target early to avoid wasting moves (and collisions near the bait).
-        Point target = plan.target();
-        if (target != null && isTargetContested(target, maze, occupied, others, 3)) {
-            ArrayList<Bait> filtered = new ArrayList<>(baitSnapshot.size());
-            for (Bait b : baitSnapshot) {
-                if (b.getX() == target.x && b.getY() == target.y) continue;
-                filtered.add(b);
+        OrientedSearch trapSearch = new OrientedSearch(maze);
+        trapSearch.computeFrom(self.x(), self.y(), self.direction(), danger);
+
+        TargetCandidate trapPrevious = evaluateLockedTarget(previousLock, world, trapSearch, trapCells);
+        TargetCandidate trapBest = findBestCandidate(world, trapSearch, trapCells, true);
+        Selection trapSelection = selectCandidate(trapPrevious, trapBest, previousLock);
+
+        if (trapSelection != null) {
+            return buildDecision(world.version(), trapSelection, self, maze, occupied);
+        }
+
+        return buildExplorationDecision(world.version(), self, maze, occupied);
+    }
+
+    private @Nullable TargetCandidate evaluateLockedTarget(@Nullable TargetLock previousLock,
+                                                           @NotNull WorldSnapshot world,
+                                                           @NotNull OrientedSearch search,
+                                                           boolean[] trapCells) {
+        if (previousLock == null) {
+            return null;
+        }
+
+        for (Bait bait : world.baits()) {
+            if (combineIntsToLong(bait.getX(), bait.getY()) != previousLock.baitId()) {
+                continue;
+            }
+            if (bait.getType() == BaitType.TRAP) {
+                return null;
+            }
+            return evaluateTargetCandidate(world, bait, search, trapCells);
+        }
+        return null;
+    }
+
+    private @Nullable TargetCandidate findBestCandidate(@NotNull WorldSnapshot world,
+                                                        @NotNull OrientedSearch search,
+                                                        boolean[] trapCells,
+                                                        boolean allowTrapPaths) {
+        TargetCandidate best = null;
+        for (Bait bait : world.baits()) {
+            if (bait.getType() == BaitType.TRAP) {
+                continue;
             }
 
-            RewardPlanner.PlanResult alt = planner.plan(new RewardPlanner.PlanRequest(maze, filtered, me, occupied));
-            if (alt != null && alt.firstMove() != null) {
-                picked = alt;
+            TargetCandidate candidate = evaluateTargetCandidate(world, bait, search, trapCells);
+            if (candidate == null) {
+                continue;
+            }
+            if (!allowTrapPaths && candidate.trapSteps() > 0) {
+                continue;
+            }
+            if (best == null || candidate.score() > best.score()) {
+                best = candidate;
             }
         }
-
-        Move move = avoidImmediateCollision(picked.firstMove(), me, others, maze, occupied);
-        return new Decision(move, picked.utility(), picked.path(), picked.target(), picked.targetLabel());
+        return best;
     }
 
-    /** Public result used by the strategy (for move + visualization). */
-    public static final class Decision {
-        private final Move firstMove;
-        private final double utility;
-        private final List<Point> path;
-        private final Point target;
-        private final String targetLabel;
-
-        Decision(@NotNull Move firstMove,
-                 double utility,
-                 @NotNull List<Point> path,
-                 @Nullable Point target,
-                 @Nullable String targetLabel) {
-            this.firstMove = firstMove;
-            this.utility = utility;
-            this.path = path;
-            this.target = target;
-            this.targetLabel = targetLabel;
+    private @Nullable TargetCandidate evaluateTargetCandidate(@NotNull WorldSnapshot world,
+                                                              @NotNull Bait bait,
+                                                              @NotNull OrientedSearch search,
+                                                              boolean[] trapCells) {
+        int distance = search.distanceTo(bait.getX(), bait.getY());
+        if (distance == Integer.MAX_VALUE) {
+            return null;
         }
 
-        public @NotNull Move firstMove() { return firstMove; }
-        public double utility() { return utility; }
-        public @NotNull List<Point> path() { return path; }
-        public @Nullable Point target() { return target; }
-        public @Nullable String targetLabel() { return targetLabel; }
+        Move firstMove = search.firstMoveTo(bait.getX(), bait.getY());
+        if (firstMove == Move.DO_NOTHING) {
+            return null;
+        }
+
+        List<Point> path = search.getPathTo(bait.getX(), bait.getY());
+        if (path.isEmpty()) {
+            return null;
+        }
+
+        int trapSteps = countTrapSteps(path, world.maze(), trapCells);
+        double score = bait.getScore() - (config.distancePenaltyPerStep() * distance);
+        score -= config.trapTraversalPenalty() * trapSteps;
+        score -= congestionPenalty(bait, world.others());
+        score -= contestPenalty(bait, distance, world.maze(), world.others());
+
+        return new TargetCandidate(bait, score, distance, trapSteps, firstMove, path);
     }
 
-    // ---------------------------------------------------------------------
-    // Dynamic player avoidance (cheap, no heavy re-planning / no oscillation logic)
-    // ---------------------------------------------------------------------
+    private @Nullable Selection selectCandidate(@Nullable TargetCandidate previousCandidate,
+                                                @Nullable TargetCandidate bestCandidate,
+                                                @Nullable TargetLock previousLock) {
+        if (previousCandidate == null) {
+            return bestCandidate == null ? null : Selection.forNewTarget(bestCandidate, config.targetCommitmentTicks());
+        }
+        if (bestCandidate == null) {
+            return Selection.forLockedTarget(previousCandidate, previousLock);
+        }
 
-    private static @Nullable boolean[] buildOccupiedGrid(@NotNull MazeModel maze, @NotNull List<PlayerState> players) {
-        int w = maze.getWidth();
-        int h = maze.getHeight();
-        if (w <= 0 || h <= 0) return null;
+        if (!shouldSwitchTarget(previousCandidate.score(), bestCandidate.score(), previousLock)) {
+            return Selection.forLockedTarget(previousCandidate, previousLock);
+        }
+        return Selection.forNewTarget(bestCandidate, config.targetCommitmentTicks());
+    }
 
-        boolean[] occupied = new boolean[w * h];
-        for (PlayerState p : players) {
-            if (p == null) continue;
-            if (!maze.inBounds(p.x(), p.y())) continue;
-            occupied[p.y() * w + p.x()] = true;
+    private boolean shouldSwitchTarget(double currentScore, double candidateScore, @Nullable TargetLock previousLock) {
+        if (candidateScore <= currentScore) {
+            return false;
+        }
+
+        if (previousLock == null || previousLock.remainingTicks() <= 0) {
+            return true;
+        }
+
+        return candidateScore >= Math.max(
+                currentScore + config.targetSwitchMargin(),
+                currentScore * config.targetSwitchMultiplier()
+        );
+    }
+
+    private @NotNull Decision buildDecision(long version,
+                                            @NotNull Selection selection,
+                                            @NotNull PlayerState self,
+                                            @NotNull MazeSnapshot maze,
+                                            @Nullable boolean[] occupied) {
+        Move move = avoidImmediateCollision(selection.candidate().firstMove(), self, maze, occupied);
+        List<Point> path = (move == selection.candidate().firstMove())
+                ? selection.candidate().path()
+                : List.of(new Point(self.x(), self.y()));
+
+        Bait bait = selection.candidate().bait();
+        Point target = new Point(bait.getX(), bait.getY());
+        return new Decision(
+                move,
+                selection.candidate().score(),
+                path,
+                target,
+                labelForScore(bait.getScore()),
+                selection.nextLock(),
+                version
+        );
+    }
+
+    private @NotNull Decision buildExplorationDecision(long version,
+                                                       @NotNull PlayerState self,
+                                                       @NotNull MazeSnapshot maze,
+                                                       @Nullable boolean[] occupied) {
+        Move move = chooseExplorationMove(self, maze, occupied);
+        List<Point> path = new ArrayList<>(2);
+        path.add(new Point(self.x(), self.y()));
+        if (move == Move.STEP) {
+            path.add(new Point(forwardX(self.x(), self.direction()), forwardY(self.y(), self.direction())));
+        }
+
+        return new Decision(move, 0.0, Collections.unmodifiableList(path), null, null, null, version);
+    }
+
+    private static int countTrapSteps(@NotNull List<Point> path, @NotNull MazeSnapshot maze, boolean[] trapCells) {
+        int trapSteps = 0;
+        for (int i = 1; i < path.size(); i++) {
+            Point p = path.get(i);
+            if (maze.inBounds(p.x, p.y) && trapCells[(p.y * maze.width()) + p.x]) {
+                trapSteps++;
+            }
+        }
+        return trapSteps;
+    }
+
+    private static double congestionPenalty(@NotNull Bait bait, @NotNull List<PlayerState> others) {
+        double penalty = 0.0;
+        for (PlayerState other : others) {
+            int distance = manhattan(other.x(), other.y(), bait.getX(), bait.getY());
+            if (distance == 0) {
+                penalty += 40.0;
+            } else if (distance == 1) {
+                penalty += 18.0;
+            } else if (distance == 2) {
+                penalty += 8.0;
+            }
+        }
+        return penalty;
+    }
+
+    private double contestPenalty(@NotNull Bait bait,
+                                  int ownDistance,
+                                  @NotNull MazeSnapshot maze,
+                                  @NotNull List<PlayerState> others) {
+        double penalty = 0.0;
+        for (PlayerState other : others) {
+            int directSteps = directApproachSteps(other, bait.getX(), bait.getY(), maze);
+            if (directSteps < 0) {
+                continue;
+            }
+            if (directSteps <= ownDistance) {
+                penalty = Math.max(penalty, config.contestedTargetPenalty());
+            } else if (directSteps <= ownDistance + 1) {
+                penalty = Math.max(penalty, config.contestedTargetPenalty() * 0.5);
+            }
+        }
+        return penalty;
+    }
+
+    private static int directApproachSteps(@NotNull PlayerState player, int targetX, int targetY, @NotNull MazeSnapshot maze) {
+        switch (player.direction()) {
+            case NORTH:
+                if (player.x() != targetX || targetY >= player.y()) return -1;
+                for (int y = player.y() - 1; y >= targetY; y--) {
+                    if (!maze.isWalkable(player.x(), y)) return -1;
+                }
+                return player.y() - targetY;
+            case SOUTH:
+                if (player.x() != targetX || targetY <= player.y()) return -1;
+                for (int y = player.y() + 1; y <= targetY; y++) {
+                    if (!maze.isWalkable(player.x(), y)) return -1;
+                }
+                return targetY - player.y();
+            case EAST:
+                if (player.y() != targetY || targetX <= player.x()) return -1;
+                for (int x = player.x() + 1; x <= targetX; x++) {
+                    if (!maze.isWalkable(x, player.y())) return -1;
+                }
+                return targetX - player.x();
+            case WEST:
+                if (player.y() != targetY || targetX >= player.x()) return -1;
+                for (int x = player.x() - 1; x >= targetX; x--) {
+                    if (!maze.isWalkable(x, player.y())) return -1;
+                }
+                return player.x() - targetX;
+            default:
+                return -1;
+        }
+    }
+
+    private static @Nullable boolean[] buildOccupiedGrid(@NotNull MazeSnapshot maze, @NotNull List<PlayerState> players) {
+        if (!maze.isReady()) {
+            return null;
+        }
+
+        boolean[] occupied = new boolean[maze.width() * maze.height()];
+        for (PlayerState player : players) {
+            if (maze.inBounds(player.x(), player.y())) {
+                occupied[(player.y() * maze.width()) + player.x()] = true;
+            }
         }
         return occupied;
     }
 
-    private static @NotNull Move avoidImmediateCollision(@NotNull Move plannedMove,
-                                                         @NotNull BotState me,
-                                                         @NotNull List<PlayerState> others,
-                                                         @NotNull MazeModel maze,
-                                                         @Nullable boolean[] occupied) {
-        if (plannedMove != Move.STEP) return plannedMove;
+    private static boolean[] buildDangerGrid(@NotNull MazeSnapshot maze, @NotNull List<PlayerState> players) {
+        boolean[] danger = new boolean[Math.max(1, maze.width() * maze.height())];
+        for (PlayerState player : players) {
+            if (maze.inBounds(player.x(), player.y())) {
+                danger[(player.y() * maze.width()) + player.x()] = true;
+            }
 
-        int w = maze.getWidth();
-        int nx = forwardX(me.x(), me.direction());
-        int ny = forwardY(me.y(), me.direction());
-
-        if (!maze.inBounds(nx, ny) || !maze.isWalkable(nx, ny)) return plannedMove;
-
-        // Avoid stepping into a cell occupied right now.
-        if (occupied != null && occupied[ny * w + nx]) {
-            return chooseAvoidanceTurn(me, maze, occupied);
-        }
-
-        // Avoid stepping into a cell another bot is very likely to step into on the same tick.
-        for (PlayerState p : others) {
-            if (p == null) continue;
-            int px = forwardX(p.x(), p.direction());
-            int py = forwardY(p.y(), p.direction());
-            if (px == nx && py == ny) {
-                return chooseAvoidanceTurn(me, maze, occupied);
+            int nx = forwardX(player.x(), player.direction());
+            int ny = forwardY(player.y(), player.direction());
+            if (maze.isWalkable(nx, ny)) {
+                danger[(ny * maze.width()) + nx] = true;
             }
         }
+        return danger;
+    }
 
+    private static boolean[] buildTrapGrid(@NotNull MazeSnapshot maze, @NotNull List<Bait> baits) {
+        boolean[] trapCells = new boolean[Math.max(1, maze.width() * maze.height())];
+        for (Bait bait : baits) {
+            if (bait.getType() == BaitType.TRAP && maze.inBounds(bait.getX(), bait.getY())) {
+                trapCells[(bait.getY() * maze.width()) + bait.getX()] = true;
+            }
+        }
+        return trapCells;
+    }
+
+    private static boolean[] mergeBlocked(@Nullable boolean[] first, @Nullable boolean[] second) {
+        if (first == null) {
+            return second == null ? null : Arrays.copyOf(second, second.length);
+        }
+        boolean[] merged = Arrays.copyOf(first, first.length);
+        if (second != null) {
+            int limit = Math.min(merged.length, second.length);
+            for (int i = 0; i < limit; i++) {
+                merged[i] = merged[i] || second[i];
+            }
+        }
+        return merged;
+    }
+
+    private static @NotNull Move avoidImmediateCollision(@NotNull Move plannedMove,
+                                                         @NotNull PlayerState self,
+                                                         @NotNull MazeSnapshot maze,
+                                                         @Nullable boolean[] occupied) {
+        if (plannedMove != Move.STEP) {
+            return plannedMove;
+        }
+
+        int nx = forwardX(self.x(), self.direction());
+        int ny = forwardY(self.y(), self.direction());
+        if (!maze.isWalkable(nx, ny)) {
+            return plannedMove;
+        }
+        if (occupied != null && occupied[(ny * maze.width()) + nx]) {
+            return chooseAvoidanceTurn(self, maze, occupied);
+        }
         return plannedMove;
     }
 
-    private static @NotNull Move chooseAvoidanceTurn(@NotNull BotState me, @NotNull MazeModel maze, @Nullable boolean[] occupied) {
-        ViewDirection left = turnLeft(me.direction());
-        ViewDirection right = turnRight(me.direction());
+    private static @NotNull Move chooseExplorationMove(@NotNull PlayerState self,
+                                                       @NotNull MazeSnapshot maze,
+                                                       @Nullable boolean[] occupied) {
+        if (isFrontCellFree(self.x(), self.y(), self.direction(), maze, occupied)) {
+            return Move.STEP;
+        }
+        return chooseAvoidanceTurn(self, maze, occupied);
+    }
 
-        boolean leftOk = isFrontCellFree(me.x(), me.y(), left, maze, occupied);
-        boolean rightOk = isFrontCellFree(me.x(), me.y(), right, maze, occupied);
+    private static @NotNull Move chooseAvoidanceTurn(@NotNull PlayerState self,
+                                                     @NotNull MazeSnapshot maze,
+                                                     @Nullable boolean[] occupied) {
+        ViewDirection left = self.direction().turnLeft();
+        ViewDirection right = self.direction().turnRight();
 
-        if (leftOk && !rightOk) return Move.TURN_L;
-        if (rightOk && !leftOk) return Move.TURN_R;
+        boolean leftOk = isFrontCellFree(self.x(), self.y(), left, maze, occupied);
+        boolean rightOk = isFrontCellFree(self.x(), self.y(), right, maze, occupied);
 
-        // If both are ok or both blocked, prefer a deterministic choice to keep behaviour stable.
+        if (leftOk && !rightOk) {
+            return Move.TURN_L;
+        }
+        if (rightOk && !leftOk) {
+            return Move.TURN_R;
+        }
         return Move.TURN_L;
     }
 
-    private static boolean isFrontCellFree(int x, int y, @NotNull ViewDirection dir, @NotNull MazeModel maze, @Nullable boolean[] occupied) {
-        int nx = forwardX(x, dir);
-        int ny = forwardY(y, dir);
-
-        if (!maze.isWalkable(nx, ny)) return false;
-        if (occupied == null) return true;
-
-        int w = maze.getWidth();
-        return maze.inBounds(nx, ny) && !occupied[ny * w + nx];
-    }
-
-    /**
-     * Returns true if a different player is within {@code maxStraightSteps} and approaching the bait
-     * in a straight line (same row/col + direction points towards the bait) with a clear corridor.
-     */
-    private static boolean isTargetContested(@NotNull Point target,
-                                             @NotNull MazeModel maze,
-                                             @Nullable boolean[] occupied,
-                                             @NotNull List<PlayerState> others,
-                                             int maxStraightSteps) {
-        for (PlayerState p : others) {
-            if (p == null) continue;
-            if (isDirectApproachWithin(p, target, maze, occupied, maxStraightSteps)) {
-                return true;
-            }
+    private static boolean isFrontCellFree(int x,
+                                           int y,
+                                           @NotNull ViewDirection direction,
+                                           @NotNull MazeSnapshot maze,
+                                           @Nullable boolean[] occupied) {
+        int nx = forwardX(x, direction);
+        int ny = forwardY(y, direction);
+        if (!maze.isWalkable(nx, ny)) {
+            return false;
         }
-        return false;
+        return occupied == null || !occupied[(ny * maze.width()) + nx];
     }
 
-    private static boolean isDirectApproachWithin(@NotNull PlayerState p,
-                                                  @NotNull Point target,
-                                                  @NotNull MazeModel maze,
-                                                  @Nullable boolean[] occupied,
-                                                  int maxSteps) {
-        int w = maze.getWidth();
+    private static int forwardX(int x, @NotNull ViewDirection direction) {
+        return switch (direction) {
+            case EAST -> x + 1;
+            case WEST -> x - 1;
+            default -> x;
+        };
+    }
 
-        switch (p.direction()) {
-            case NORTH:
-                if (p.x() != target.x) return false;
-                if (target.y >= p.y()) return false;
-                if ((p.y() - target.y) > maxSteps) return false;
-                for (int y = p.y() - 1; y >= target.y; y--) {
-                    if (!maze.isWalkable(p.x(), y)) return false;
-                    if (occupied != null && occupied[y * w + p.x()]) return false;
-                }
-                return true;
+    private static int forwardY(int y, @NotNull ViewDirection direction) {
+        return switch (direction) {
+            case SOUTH -> y + 1;
+            case NORTH -> y - 1;
+            default -> y;
+        };
+    }
 
-            case SOUTH:
-                if (p.x() != target.x) return false;
-                if (target.y <= p.y()) return false;
-                if ((target.y - p.y()) > maxSteps) return false;
-                for (int y = p.y() + 1; y <= target.y; y++) {
-                    if (!maze.isWalkable(p.x(), y)) return false;
-                    if (occupied != null && occupied[y * w + p.x()]) return false;
-                }
-                return true;
+    private static int manhattan(int x1, int y1, int x2, int y2) {
+        return Math.abs(x1 - x2) + Math.abs(y1 - y2);
+    }
 
-            case EAST:
-                if (p.y() != target.y) return false;
-                if (target.x <= p.x()) return false;
-                if ((target.x - p.x()) > maxSteps) return false;
-                for (int x = p.x() + 1; x <= target.x; x++) {
-                    if (!maze.isWalkable(x, p.y())) return false;
-                    if (occupied != null && occupied[p.y() * w + x]) return false;
-                }
-                return true;
+    private static String labelForScore(int score) {
+        if (score == 314) return "GEM";
+        if (score == 42) return "COFFEE";
+        if (score == 13) return "FOOD";
+        return String.valueOf(score);
+    }
 
-            case WEST:
-                if (p.y() != target.y) return false;
-                if (target.x >= p.x()) return false;
-                if ((p.x() - target.x) > maxSteps) return false;
-                for (int x = p.x() - 1; x >= target.x; x--) {
-                    if (!maze.isWalkable(x, p.y())) return false;
-                    if (occupied != null && occupied[p.y() * w + x]) return false;
-                }
-                return true;
+    public record PlannerConfig(
+            double distancePenaltyPerStep,
+            double trapTraversalPenalty,
+            double contestedTargetPenalty,
+            double targetSwitchMultiplier,
+            double targetSwitchMargin,
+            int targetCommitmentTicks
+    ) {
+    }
 
-            default:
-                return false;
+    public record Decision(
+            @NotNull Move firstMove,
+            double utility,
+            @NotNull List<Point> path,
+            @Nullable Point target,
+            @Nullable String targetLabel,
+            @Nullable TargetLock nextTargetLock,
+            long sourceVersion
+    ) {
+    }
+
+    public record TargetLock(long baitId, int remainingTicks) {
+
+        public static @NotNull TargetLock forBait(@NotNull Bait bait, int ticks) {
+            return new TargetLock(combineIntsToLong(bait.getX(), bait.getY()), Math.max(0, ticks));
+        }
+
+        public @NotNull TargetLock decay() {
+            return new TargetLock(baitId, Math.max(0, remainingTicks - 1));
         }
     }
 
-    private static int forwardX(int x, @NotNull ViewDirection dir) {
-        switch (dir) {
-            case EAST:  return x + 1;
-            case WEST:  return x - 1;
-            default:    return x;
+    public record WorldSnapshot(
+            long version,
+            @NotNull MazeSnapshot maze,
+            @Nullable PlayerState self,
+            @NotNull List<PlayerState> others,
+            @NotNull List<Bait> baits
+    ) {
+    }
+
+    public record PlayerState(
+            int id,
+            @Nullable String nick,
+            int x,
+            int y,
+            @NotNull ViewDirection direction,
+            int score
+    ) {
+        public static @NotNull PlayerState fromSnapshot(@NotNull PlayerSnapshot snapshot) {
+            return new PlayerState(
+                    snapshot.getId(),
+                    snapshot.getNick(),
+                    snapshot.getX(),
+                    snapshot.getY(),
+                    snapshot.getViewDirection(),
+                    snapshot.getScore()
+            );
         }
     }
 
-    private static int forwardY(int y, @NotNull ViewDirection dir) {
-        switch (dir) {
-            case SOUTH: return y + 1;
-            case NORTH: return y - 1;
-            default:    return y;
-        }
-    }
+    public static final class MazeSnapshot {
 
-    private static @NotNull ViewDirection turnLeft(@NotNull ViewDirection d) {
-        switch (d) {
-            case NORTH: return ViewDirection.WEST;
-            case EAST:  return ViewDirection.NORTH;
-            case SOUTH: return ViewDirection.EAST;
-            case WEST:  return ViewDirection.SOUTH;
-            default:    return d;
-        }
-    }
+        private static final MazeSnapshot EMPTY = new MazeSnapshot(0, 0, new boolean[0]);
 
-    private static @NotNull ViewDirection turnRight(@NotNull ViewDirection d) {
-        switch (d) {
-            case NORTH: return ViewDirection.EAST;
-            case EAST:  return ViewDirection.SOUTH;
-            case SOUTH: return ViewDirection.WEST;
-            case WEST:  return ViewDirection.NORTH;
-            default:    return d;
-        }
-    }
+        private final int width;
+        private final int height;
+        private final boolean[] walkable;
 
-    // ---------------------------------------------------------------------
-    // Internal model
-    // ---------------------------------------------------------------------
-
-    private static final class BotState {
-        private final int x;
-        private final int y;
-        private final ViewDirection direction;
-
-        BotState(int x, int y, @NotNull ViewDirection direction) {
-            this.x = x;
-            this.y = y;
-            this.direction = direction;
+        private MazeSnapshot(int width, int height, boolean[] walkable) {
+            this.width = width;
+            this.height = height;
+            this.walkable = walkable;
         }
 
-        int x() { return x; }
-        int y() { return y; }
-        @NotNull ViewDirection direction() { return direction; }
-    }
-
-    private static final class PlayerState {
-        private final int x;
-        private final int y;
-        private final ViewDirection direction;
-        private final @Nullable String nick;
-
-        PlayerState(int x, int y, @NotNull ViewDirection direction, @Nullable String nick) {
-            this.x = x;
-            this.y = y;
-            this.direction = direction;
-            this.nick = nick;
+        public static @NotNull MazeSnapshot empty() {
+            return EMPTY;
         }
 
-        int x() { return x; }
-        int y() { return y; }
-        @NotNull ViewDirection direction() { return direction; }
-        @Nullable String nick() { return nick; }
-    }
-
-    /**
-     * Maze snapshot with a walkable grid.
-     * Thread-safe by publication: build a new array then assign reference.
-     */
-    private static final class MazeModel {
-        private volatile int width;
-        private volatile int height;
-        private volatile boolean[] walkable;
-
-        void updateFromMazeLines(int width, int height, @NotNull List<String> mazeLines) {
-            boolean[] w = new boolean[Math.max(0, width) * Math.max(0, height)];
+        public static @NotNull MazeSnapshot fromMazeLines(int width, int height, @NotNull List<String> mazeLines) {
+            boolean[] walkable = new boolean[Math.max(0, width) * Math.max(0, height)];
 
             for (int y = 0; y < height && y < mazeLines.size(); y++) {
                 String line = mazeLines.get(y);
-                if (line == null) continue;
+                if (line == null) {
+                    continue;
+                }
 
                 int perCell = 1;
                 if (width > 0) {
-                    // Common encodings:
-                    //  - width chars (one per cell)
-                    //  - 2*width or 2*width-1 chars (one char per cell + separator)
-                    //  - N*width chars (fixed-width multi-char cells)
                     if (line.length() == (width * 2) || line.length() == (width * 2 - 1)) {
                         perCell = 2;
                     } else if (line.length() >= width && line.length() % width == 0) {
@@ -383,815 +535,257 @@ public final class MaleniaEngine {
                 }
 
                 for (int x = 0; x < width; x++) {
-                    int idx = x * perCell;
-                    char c = (idx < line.length()) ? line.charAt(idx) : '#';
-                    w[y * width + x] = !isBlockedChar(c);
+                    int charIndex = x * perCell;
+                    char cell = charIndex < line.length() ? line.charAt(charIndex) : '#';
+                    walkable[(y * width) + x] = !isBlockedChar(cell);
                 }
             }
 
-            this.width = width;
-            this.height = height;
-            this.walkable = w;
+            return new MazeSnapshot(width, height, walkable);
         }
 
-        boolean isReady() {
-            return walkable != null && width > 0 && height > 0;
+        public boolean isReady() {
+            return width > 0 && height > 0 && walkable.length == width * height;
         }
 
-        boolean inBounds(int x, int y) {
+        public int width() {
+            return width;
+        }
+
+        public int height() {
+            return height;
+        }
+
+        public boolean inBounds(int x, int y) {
             return x >= 0 && y >= 0 && x < width && y < height;
         }
 
-        boolean isWalkable(int x, int y) {
-            boolean[] w = walkable;
-            return w != null && inBounds(x, y) && w[y * width + x];
+        public boolean isWalkable(int x, int y) {
+            return inBounds(x, y) && walkable[(y * width) + x];
         }
 
-        int getWidth() { return width; }
-        int getHeight() { return height; }
-        boolean[] walkableGrid() { return walkable; }
-
-        private static boolean isBlockedChar(char c) {
-            return c == '#'
-                    || c == 'X'
-                    || c == 'W'
-                    || c == '█'
-                    || c == '■'
-                    || c == '?'
-                    || c == 'O'
-                    || c == 'o'
-                    || c == '1';
+        private static boolean isBlockedChar(char cell) {
+            return cell == '#'
+                    || cell == '-'
+                    || cell == 'X'
+                    || cell == 'W'
+                    || cell == '█'
+                    || cell == '■'
+                    || cell == '?'
+                    || cell == 'O'
+                    || cell == 'o'
+                    || cell == '1';
         }
     }
 
-    /** Tuning parameters for the reward planner. */
-    public static final class PlannerConfig {
-        private final int maxDepth;
-        private final int maxExpansions;
-        private final int candidateBaits;
-        private final double moveCost;
-        private final double trapStepPenalty;
-
-        public PlannerConfig(int maxDepth,
-                             int maxExpansions,
-                             int candidateBaits,
-                             double moveCost,
-                             double trapStepPenalty) {
-            this.maxDepth = maxDepth;
-            this.maxExpansions = maxExpansions;
-            this.candidateBaits = candidateBaits;
-            this.moveCost = moveCost;
-            this.trapStepPenalty = trapStepPenalty;
-        }
-
-        public int maxDepth() { return maxDepth; }
-        public int maxExpansions() { return maxExpansions; }
-        public int candidateBaits() { return candidateBaits; }
-        public double moveCost() { return moveCost; }
-        public double trapStepPenalty() { return trapStepPenalty; }
+    private record TargetCandidate(
+            @NotNull Bait bait,
+            double score,
+            int distance,
+            int trapSteps,
+            @NotNull Move firstMove,
+            @NotNull List<Point> path
+    ) {
     }
 
-    // ---------------------------------------------------------------------
-    // Reflection-based client access (kept to avoid relying on unstable API)
-    // ---------------------------------------------------------------------
+    private record Selection(@NotNull TargetCandidate candidate, @NotNull TargetLock nextLock) {
 
-    private static final class ClientAccess {
-        private volatile boolean mazeClientFieldResolved;
-        private volatile @Nullable Field mazeClientField;
-
-        @Nullable BotState readOwnState(@NotNull Strategy strategy, @NotNull String fallbackNick) {
-            Object client = getMazeClient(strategy);
-            if (client == null) return null;
-
-            Object me = invokeNoArg(client, "getOwnPlayerSnapshot");
-            if (me == null) me = invokeNoArg(client, "getOwnPlayerView");
-            if (me == null) me = invokeNoArg(client, "getOwnPlayer");
-            if (me == null) me = readField(client, "ownPlayer");
-            if (me == null) me = invokeNoArg(client, "getMe");
-            if (me != null) {
-                BotState s = stateFromPlayerLike(me);
-                if (s != null) return s;
-            }
-
-            Object playersObj = invokeNoArg(client, "getPlayers");
-            if (playersObj instanceof List<?>) {
-                List<?> players = (List<?>) playersObj;
-                for (Object p : players) {
-                    String nick = readString(p, "getNick", "nick");
-                    if (nick != null && nick.equalsIgnoreCase(fallbackNick)) {
-                        return stateFromPlayerLike(p);
-                    }
-                }
-                if (!players.isEmpty()) {
-                    return stateFromPlayerLike(players.get(0));
-                }
-            }
-
-            return null;
+        private static @NotNull Selection forNewTarget(@NotNull TargetCandidate candidate, int ticks) {
+            return new Selection(candidate, TargetLock.forBait(candidate.bait(), ticks));
         }
 
-        @NotNull List<PlayerState> readOtherPlayers(@NotNull Strategy strategy,
-                                                    @NotNull String fallbackNick,
-                                                    @NotNull BotState me) {
-            Object client = getMazeClient(strategy);
-            if (client == null) return Collections.emptyList();
-
-            Object playersObj = invokeNoArg(client, "getPlayers");
-            if (!(playersObj instanceof List<?>)) return Collections.emptyList();
-
-            ArrayList<PlayerState> out = new ArrayList<>();
-            for (Object p : (List<?>) playersObj) {
-                if (p == null) continue;
-
-                String nick = readString(p, "getNick", "nick");
-                if (nick != null && nick.equalsIgnoreCase(fallbackNick)) continue;
-
-                BotState s = stateFromPlayerLike(p);
-                if (s == null) continue;
-
-                if (s.x() == me.x() && s.y() == me.y()) continue;
-
-                out.add(new PlayerState(s.x(), s.y(), s.direction(), nick));
+        private static @NotNull Selection forLockedTarget(@NotNull TargetCandidate candidate, @Nullable TargetLock currentLock) {
+            if (currentLock == null) {
+                return new Selection(candidate, TargetLock.forBait(candidate.bait(), 0));
             }
-
-            return out.isEmpty() ? Collections.emptyList() : out;
-        }
-
-        void refreshBaits(@NotNull Strategy strategy, @NotNull ConcurrentHashMap<Long, Bait> into) {
-            Object client = getMazeClient(strategy);
-            if (client == null) return;
-
-            Object baitsObj = invokeNoArg(client, "getBaits");
-            if (baitsObj instanceof List<?>) {
-                for (Object o : (List<?>) baitsObj) {
-                    if (o instanceof Bait) {
-                        Bait b = (Bait) o;
-                        into.put(combineIntsToLong(b.getX(), b.getY()), b);
-                    }
-                }
-            }
-        }
-
-        private @Nullable BotState stateFromPlayerLike(@Nullable Object p) {
-            if (p == null) return null;
-
-            int x = readInt(p, "getX", "x");
-            int y = readInt(p, "getY", "y");
-
-            Object dirObj = invokeNoArg(p, "getViewDirection");
-            ViewDirection dir = null;
-            if (dirObj instanceof ViewDirection) dir = (ViewDirection) dirObj;
-
-            if (dir == null) {
-                Object dirField = readField(p, "viewDirection");
-                if (dirField instanceof ViewDirection) dir = (ViewDirection) dirField;
-            }
-
-            if (dir == null) return null;
-            return new BotState(x, y, dir);
-        }
-
-        private @Nullable Object getMazeClient(@NotNull Strategy strategy) {
-            if (!mazeClientFieldResolved) {
-                mazeClientFieldResolved = true;
-                mazeClientField = resolveMazeClientField(strategy.getClass());
-            }
-
-            Field f = mazeClientField;
-            if (f == null) return null;
-            try {
-                return f.get(strategy);
-            } catch (Exception ignored) {
-                return null;
-            }
-        }
-
-        private static @Nullable Field resolveMazeClientField(@NotNull Class<?> type) {
-            Class<?> c = type;
-            while (c != null) {
-                try {
-                    Field f = c.getDeclaredField("mazeClient");
-                    f.setAccessible(true);
-                    return f;
-                } catch (NoSuchFieldException ignored) {
-                    c = c.getSuperclass();
-                } catch (Exception e) {
-                    return null;
-                }
-            }
-            return null;
-        }
-
-        private static @Nullable Object invokeNoArg(@Nullable Object target, @NotNull String methodName) {
-            if (target == null) return null;
-            try {
-                Method m = target.getClass().getMethod(methodName);
-                return m.invoke(target);
-            } catch (Exception ignored) {
-                return null;
-            }
-        }
-
-        private static @Nullable Object readField(@Nullable Object target, @NotNull String fieldName) {
-            if (target == null) return null;
-
-            try {
-                Field f = target.getClass().getField(fieldName);
-                return f.get(target);
-            } catch (Exception ignored) {
-            }
-
-            try {
-                Field f = target.getClass().getDeclaredField(fieldName);
-                f.setAccessible(true);
-                return f.get(target);
-            } catch (Exception ignored) {
-                return null;
-            }
-        }
-
-        private static int readInt(@Nullable Object target, @NotNull String getterName, @NotNull String fieldName) {
-            if (target == null) return 0;
-
-            try {
-                Method m = target.getClass().getMethod(getterName);
-                Object v = m.invoke(target);
-                if (v instanceof Integer) return (Integer) v;
-            } catch (Exception ignored) {
-            }
-
-            try {
-                Field f = target.getClass().getField(fieldName);
-                Object v = f.get(target);
-                if (v instanceof Integer) return (Integer) v;
-            } catch (Exception ignored) {
-            }
-
-            try {
-                Field f = target.getClass().getDeclaredField(fieldName);
-                f.setAccessible(true);
-                Object v = f.get(target);
-                if (v instanceof Integer) return (Integer) v;
-            } catch (Exception ignored) {
-                return 0;
-            }
-
-            return 0;
-        }
-
-        private static @Nullable String readString(@Nullable Object target, @NotNull String getterName, @NotNull String fieldName) {
-            if (target == null) return null;
-
-            try {
-                Method m = target.getClass().getMethod(getterName);
-                Object v = m.invoke(target);
-                if (v instanceof String) return (String) v;
-            } catch (Exception ignored) {
-            }
-
-            try {
-                Field f = target.getClass().getField(fieldName);
-                Object v = f.get(target);
-                if (v instanceof String) return (String) v;
-            } catch (Exception ignored) {
-            }
-
-            try {
-                Field f = target.getClass().getDeclaredField(fieldName);
-                f.setAccessible(true);
-                Object v = f.get(target);
-                if (v instanceof String) return (String) v;
-            } catch (Exception ignored) {
-                return null;
-            }
-
-            return null;
+            return new Selection(candidate, currentLock.decay());
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Planner (same behaviour, simplified types + less plumbing)
-    // ---------------------------------------------------------------------
+    /**
+     * Minimal oriented BFS over (x, y, direction) states.
+     */
+    private static final class OrientedSearch {
 
-    private static final class RewardPlanner {
+        private static final int DIRECTION_COUNT = ViewDirection.values().length;
 
-        private static final long MAX_NANOS = 8_000_000L;
-        private final PlannerConfig config;
+        private final MazeSnapshot maze;
+        private final int[] distances;
+        private final Move[] firstMoves;
+        private final int[] previous;
 
-        RewardPlanner(@NotNull PlannerConfig config) {
-            this.config = config;
+        private OrientedSearch(@NotNull MazeSnapshot maze) {
+            this.maze = maze;
+            int stateCount = Math.max(1, maze.width() * maze.height() * DIRECTION_COUNT);
+            this.distances = new int[stateCount];
+            this.firstMoves = new Move[stateCount];
+            this.previous = new int[stateCount];
         }
 
-        @Nullable PlanResult plan(@NotNull PlanRequest request) {
-            PlanResult safePlan = planInternal(request, true);
-            if (safePlan != null && safePlan.utility() > 0.0) return safePlan;
-            return planInternal(request, false);
+        void computeFrom(int startX, int startY, @NotNull ViewDirection startDirection, @Nullable boolean[] blockedCells) {
+            Arrays.fill(distances, Integer.MAX_VALUE);
+            Arrays.fill(firstMoves, Move.DO_NOTHING);
+            Arrays.fill(previous, -1);
+
+            if (!maze.isWalkable(startX, startY)) {
+                return;
+            }
+
+            ArrayDeque<Integer> queue = new ArrayDeque<>();
+            int startState = toStateIndex(startX, startY, startDirection.ordinal());
+            distances[startState] = 0;
+            queue.add(startState);
+
+            while (!queue.isEmpty()) {
+                int current = queue.removeFirst();
+                int currentDistance = distances[current];
+                int cellIndex = current / DIRECTION_COUNT;
+                int directionIndex = current % DIRECTION_COUNT;
+                int x = cellIndex % maze.width();
+                int y = cellIndex / maze.width();
+
+                enqueueTurn(queue, current, currentDistance, x, y, rotateLeft(directionIndex), Move.TURN_L);
+                enqueueTurn(queue, current, currentDistance, x, y, rotateRight(directionIndex), Move.TURN_R);
+                enqueueStep(queue, current, currentDistance, x, y, directionIndex, blockedCells);
+            }
         }
 
-        private @Nullable PlanResult planInternal(@NotNull PlanRequest request, boolean forbidTraps) {
-            MazeModel maze = request.maze;
-            if (!maze.isReady()) return null;
-
-            PlanInput input = buildPlanInput(request, forbidTraps);
-            if (input.candidates.length == 0) return null;
-
-            long deadline = System.nanoTime() + MAX_NANOS;
-
-            int k = input.candidates.length;
-            long[] candId = new long[k];
-            int[] candScore = new int[k];
-            for (int i = 0; i < k; i++) {
-                Bait b = input.candidates[i];
-                candId[i] = combineIntsToLong(b.getX(), b.getY());
-                candScore[i] = b.getScore();
+        int distanceTo(int targetX, int targetY) {
+            if (!maze.inBounds(targetX, targetY)) {
+                return Integer.MAX_VALUE;
             }
 
-            int[] sortedScores = Arrays.copyOf(candScore, k);
-            Arrays.sort(sortedScores);
-
-            PriorityQueue<Node> open = new PriorityQueue<>((a, b) -> {
-                int c = Double.compare(b.bound, a.bound);
-                if (c != 0) return c;
-                return Integer.compare(a.tie, b.tie);
-            });
-
-            HashMap<StateKey, Double> bestSeen = new HashMap<>(4096);
-
-            Node startNode = new Node(
-                    request.start.x(), request.start.y(), request.start.direction(),
-                    0, 0, 0, 0L,
-                    null,
-                    null,
-                    0.0
-            );
-            startNode.utility = computeUtility(startNode.reward, startNode.moves, startNode.trapSteps, forbidTraps);
-            startNode.bound = startNode.utility + optimisticRemaining(sortedScores, startNode.collectedMask, k, config.maxDepth());
-            startNode.tie = 1;
-
-            open.add(startNode);
-            bestSeen.put(new StateKey(startNode), startNode.utility);
-
-            Node best = null;
-            int expansions = 0;
-
-            while (!open.isEmpty() && expansions < config.maxExpansions()) {
-                if (System.nanoTime() > deadline) break;
-                Node cur = open.poll();
-                expansions++;
-
-                if (cur.moves > config.maxDepth()) continue;
-
-                if (best == null || cur.utility > best.utility + 1e-9) {
-                    if (cur.reward > 0 && cur.firstMove != null) {
-                        best = cur;
-                    }
-                }
-
-                expandTurn(cur, true, input, k, sortedScores, bestSeen, open, forbidTraps);
-                expandTurn(cur, false, input, k, sortedScores, bestSeen, open, forbidTraps);
-                expandStep(cur, input, candId, candScore, k, sortedScores, bestSeen, open, forbidTraps);
+            int base = toCellIndex(targetX, targetY) * DIRECTION_COUNT;
+            int best = Integer.MAX_VALUE;
+            for (int i = 0; i < DIRECTION_COUNT; i++) {
+                best = Math.min(best, distances[base + i]);
             }
-
-            if (best == null) return null;
-
-            PlanVisual visual = buildVisual(best, candId, candScore);
-            return new PlanResult(best.firstMove, best.utility, visual.path, visual.target, visual.label);
+            return best;
         }
 
-        private PlanInput buildPlanInput(@NotNull PlanRequest request, boolean forbidTraps) {
-            MazeModel maze = request.maze;
-            int width = maze.getWidth();
-            int height = maze.getHeight();
-
-            boolean[] trapCell = new boolean[width * height];
-            boolean[] occupiedCell = request.occupiedCell;
-            if (occupiedCell != null && occupiedCell.length != (width * height)) {
-                occupiedCell = null;
+        @NotNull Move firstMoveTo(int targetX, int targetY) {
+            if (!maze.inBounds(targetX, targetY)) {
+                return Move.DO_NOTHING;
             }
-            ArrayList<Bait> positives = new ArrayList<>();
 
-            int[] dist = computeDistances(maze, request.start.x(), request.start.y());
-
-            for (Bait b : request.baits) {
-                if (b == null) continue;
-                int x = b.getX();
-                int y = b.getY();
-                if (!maze.inBounds(x, y)) continue;
-
-                if (b.getScore() < 0) {
-                    trapCell[y * width + x] = true;
-                    continue;
-                }
-
-                if (b.getScore() > 0) {
-                    int d = dist[y * width + x];
-                    if (d >= 0) positives.add(b);
+            int base = toCellIndex(targetX, targetY) * DIRECTION_COUNT;
+            int bestDistance = Integer.MAX_VALUE;
+            Move bestMove = Move.DO_NOTHING;
+            for (int i = 0; i < DIRECTION_COUNT; i++) {
+                int state = base + i;
+                if (distances[state] < bestDistance) {
+                    bestDistance = distances[state];
+                    bestMove = firstMoves[state];
                 }
             }
-
-            if (forbidTraps && positives.isEmpty()) {
-                return new PlanInput(width, height, maze.walkableGrid(), trapCell, occupiedCell, new Bait[0]);
-            }
-
-            positives.sort((a, b) -> Double.compare(
-                    baitRankScore(b, dist, width),
-                    baitRankScore(a, dist, width)
-            ));
-
-            int k = Math.min(config.candidateBaits(), positives.size());
-            Bait[] cand = new Bait[k];
-            for (int i = 0; i < k; i++) cand[i] = positives.get(i);
-
-            return new PlanInput(width, height, maze.walkableGrid(), trapCell, occupiedCell, cand);
+            return bestMove;
         }
 
-        private static double baitRankScore(Bait bait, int[] dist, int width) {
-            int d = dist[bait.getY() * width + bait.getX()];
-            return (double) bait.getScore() / (double) (d + 2);
-        }
-
-        private static int[] computeDistances(MazeModel maze, int startX, int startY) {
-            int width = maze.getWidth();
-            int height = maze.getHeight();
-            int[] dist = new int[width * height];
-            Arrays.fill(dist, -1);
-
-            if (!maze.inBounds(startX, startY) || !maze.isWalkable(startX, startY)) return dist;
-
-            int[] qx = new int[width * height];
-            int[] qy = new int[width * height];
-            int head = 0;
-            int tail = 0;
-
-            dist[startY * width + startX] = 0;
-            qx[tail] = startX;
-            qy[tail] = startY;
-            tail++;
-
-            while (head < tail) {
-                int x = qx[head];
-                int y = qy[head];
-                head++;
-
-                int next = dist[y * width + x] + 1;
-
-                if (maze.isWalkable(x + 1, y) && dist[y * width + x + 1] < 0) {
-                    dist[y * width + x + 1] = next;
-                    qx[tail] = x + 1; qy[tail] = y; tail++;
-                }
-                if (maze.isWalkable(x - 1, y) && dist[y * width + x - 1] < 0) {
-                    dist[y * width + x - 1] = next;
-                    qx[tail] = x - 1; qy[tail] = y; tail++;
-                }
-                if (maze.isWalkable(x, y + 1) && dist[(y + 1) * width + x] < 0) {
-                    dist[(y + 1) * width + x] = next;
-                    qx[tail] = x; qy[tail] = y + 1; tail++;
-                }
-                if (maze.isWalkable(x, y - 1) && dist[(y - 1) * width + x] < 0) {
-                    dist[(y - 1) * width + x] = next;
-                    qx[tail] = x; qy[tail] = y - 1; tail++;
-                }
+        @NotNull List<Point> getPathTo(int targetX, int targetY) {
+            int bestState = findBestArrivalState(targetX, targetY);
+            if (bestState < 0) {
+                return List.of();
             }
 
-            return dist;
-        }
-
-        private void expandTurn(Node cur,
-                                boolean left,
-                                PlanInput input,
-                                int k,
-                                int[] sortedScores,
-                                HashMap<StateKey, Double> bestSeen,
-                                PriorityQueue<Node> open,
-                                boolean forbidTraps) {
-            ViewDirection nextDir = left ? turnLeft(cur.dir) : turnRight(cur.dir);
-            Move move = left ? Move.TURN_L : Move.TURN_R;
-
-            Node next = new Node(
-                    cur.x, cur.y, nextDir,
-                    cur.moves + 1,
-                    cur.reward,
-                    cur.trapSteps,
-                    cur.collectedMask,
-                    cur.firstMove != null ? cur.firstMove : move,
-                    cur,
-                    0.0
-            );
-
-            pushIfBetter(next, input, k, sortedScores, bestSeen, open, forbidTraps, 2);
-        }
-
-        private void expandStep(Node cur,
-                                PlanInput input,
-                                long[] candId,
-                                int[] candScore,
-                                int k,
-                                int[] sortedScores,
-                                HashMap<StateKey, Double> bestSeen,
-                                PriorityQueue<Node> open,
-                                boolean forbidTraps) {
-            int nx = cur.x;
-            int ny = cur.y;
-
-            switch (cur.dir) {
-                case NORTH: ny -= 1; break;
-                case EAST:  nx += 1; break;
-                case SOUTH: ny += 1; break;
-                case WEST:  nx -= 1; break;
-            }
-
-            if (!input.inBounds(nx, ny)) return;
-            if (!input.walkable[ny * input.w + nx]) return;
-            if (input.occupiedCell != null && input.occupiedCell[ny * input.w + nx]) return;
-
-            boolean isTrap = input.trapCell[ny * input.w + nx];
-            if (forbidTraps && isTrap) return;
-
-            int reward = cur.reward;
-            int trapSteps = cur.trapSteps;
-            long mask = cur.collectedMask;
-
-            if (isTrap) {
-                reward += TRAP_SCORE;
-                trapSteps += 1;
-            }
-
-            long id = combineIntsToLong(nx, ny);
-            for (int i = 0; i < k; i++) {
-                if (candId[i] == id) {
-                    long bit = (1L << i);
-                    if ((mask & bit) == 0L) {
-                        mask |= bit;
-                        reward += candScore[i];
-                    }
-                    break;
-                }
-            }
-
-            Node next = new Node(
-                    nx, ny, cur.dir,
-                    cur.moves + 1,
-                    reward,
-                    trapSteps,
-                    mask,
-                    cur.firstMove != null ? cur.firstMove : Move.STEP,
-                    cur,
-                    0.0
-            );
-
-            pushIfBetter(next, input, k, sortedScores, bestSeen, open, forbidTraps, 0);
-        }
-
-        private void pushIfBetter(Node next,
-                                  PlanInput input,
-                                  int k,
-                                  int[] sortedScores,
-                                  HashMap<StateKey, Double> bestSeen,
-                                  PriorityQueue<Node> open,
-                                  boolean forbidTraps,
-                                  int tie) {
-            if (next.moves > config.maxDepth()) return;
-
-            next.utility = computeUtility(next.reward, next.moves, next.trapSteps, forbidTraps);
-            next.bound = next.utility + optimisticRemaining(sortedScores, next.collectedMask, k, config.maxDepth() - next.moves);
-            next.tie = tie;
-
-            StateKey key = new StateKey(next);
-            Double bestU = bestSeen.get(key);
-
-            if (bestU == null || next.utility > bestU + 1e-9) {
-                bestSeen.put(key, next.utility);
-                open.add(next);
-            }
-        }
-
-        private double computeUtility(int reward, int moves, int trapSteps, boolean forbidTraps) {
-            double utility = reward - (config.moveCost() * moves);
-            if (!forbidTraps) {
-                utility -= (config.trapStepPenalty() * trapSteps);
-            }
-            return utility;
-        }
-
-        private static double optimisticRemaining(int[] sortedScoresAsc, long mask, int k, int remainingMoves) {
-            if (remainingMoves <= 0 || k == 0) return 0.0;
-
-            int maxPicks = Math.min(remainingMoves, k);
-            double sum = 0.0;
-            int picked = 0;
-
-            for (int i = k - 1; i >= 0 && picked < maxPicks; i--) {
-                int score = sortedScoresAsc[i];
-                if (score <= 0) break;
-                sum += score;
-                picked++;
-            }
-            return sum;
-        }
-
-        private static ViewDirection turnLeft(ViewDirection d) {
-            switch (d) {
-                case NORTH: return ViewDirection.WEST;
-                case EAST:  return ViewDirection.NORTH;
-                case SOUTH: return ViewDirection.EAST;
-                case WEST:  return ViewDirection.SOUTH;
-                default:    return d;
-            }
-        }
-
-        private static ViewDirection turnRight(ViewDirection d) {
-            switch (d) {
-                case NORTH: return ViewDirection.EAST;
-                case EAST:  return ViewDirection.SOUTH;
-                case SOUTH: return ViewDirection.WEST;
-                case WEST:  return ViewDirection.NORTH;
-                default:    return d;
-            }
-        }
-
-        private static PlanVisual buildVisual(Node best, long[] candId, int[] candScore) {
             ArrayList<Point> reversed = new ArrayList<>();
-            Node n = best;
-            while (n != null) {
-                reversed.add(new Point(n.x, n.y));
-                n = n.parent;
+            int current = bestState;
+            while (current >= 0) {
+                int cellIndex = current / DIRECTION_COUNT;
+                int x = cellIndex % maze.width();
+                int y = cellIndex / maze.width();
+                if (reversed.isEmpty()
+                        || reversed.get(reversed.size() - 1).x != x
+                        || reversed.get(reversed.size() - 1).y != y) {
+                    reversed.add(new Point(x, y));
+                }
+                current = previous[current];
             }
 
-            ArrayList<Point> path = new ArrayList<>(reversed.size());
-            for (int i = reversed.size() - 1; i >= 0; i--) {
-                Point p = reversed.get(i);
-                if (path.isEmpty()) {
-                    path.add(p);
-                } else {
-                    Point last = path.get(path.size() - 1);
-                    if (last.x != p.x || last.y != p.y) {
-                        path.add(p);
-                    }
+            Collections.reverse(reversed);
+            return Collections.unmodifiableList(reversed);
+        }
+
+        private void enqueueTurn(ArrayDeque<Integer> queue,
+                                 int current,
+                                 int currentDistance,
+                                 int x,
+                                 int y,
+                                 int nextDirection,
+                                 Move turnMove) {
+            int next = toStateIndex(x, y, nextDirection);
+            relax(queue, current, currentDistance, next, turnMove);
+        }
+
+        private void enqueueStep(ArrayDeque<Integer> queue,
+                                 int current,
+                                 int currentDistance,
+                                 int x,
+                                 int y,
+                                 int directionIndex,
+                                 @Nullable boolean[] blockedCells) {
+            ViewDirection direction = ViewDirection.values()[directionIndex];
+            int nextX = forwardX(x, direction);
+            int nextY = forwardY(y, direction);
+
+            if (!maze.isWalkable(nextX, nextY)) {
+                return;
+            }
+
+            int nextCell = toCellIndex(nextX, nextY);
+            if (blockedCells != null && nextCell < blockedCells.length && blockedCells[nextCell]) {
+                return;
+            }
+
+            relax(queue, current, currentDistance, toStateIndex(nextX, nextY, directionIndex), Move.STEP);
+        }
+
+        private void relax(ArrayDeque<Integer> queue,
+                           int current,
+                           int currentDistance,
+                           int next,
+                           Move move) {
+            if (distances[next] != Integer.MAX_VALUE) {
+                return;
+            }
+
+            distances[next] = currentDistance + 1;
+            previous[next] = current;
+            firstMoves[next] = currentDistance == 0 ? move : firstMoves[current];
+            queue.addLast(next);
+        }
+
+        private int findBestArrivalState(int targetX, int targetY) {
+            if (!maze.inBounds(targetX, targetY)) {
+                return -1;
+            }
+
+            int base = toCellIndex(targetX, targetY) * DIRECTION_COUNT;
+            int bestState = -1;
+            int bestDistance = Integer.MAX_VALUE;
+            for (int i = 0; i < DIRECTION_COUNT; i++) {
+                int state = base + i;
+                if (distances[state] < bestDistance) {
+                    bestDistance = distances[state];
+                    bestState = state;
                 }
             }
-
-            Point target = null;
-            String label = null;
-            for (Point p : path) {
-                long id = combineIntsToLong(p.x, p.y);
-                for (int i = 0; i < candId.length; i++) {
-                    if (candId[i] == id) {
-                        target = p;
-                        label = labelForScore(candScore[i]);
-                        break;
-                    }
-                }
-                if (target != null) break;
-            }
-
-            return new PlanVisual(Collections.unmodifiableList(path), target, label);
+            return bestDistance == Integer.MAX_VALUE ? -1 : bestState;
         }
 
-        private static String labelForScore(int score) {
-            if (score == 314) return "GEM";
-            if (score == 42) return "COFFEE";
-            if (score == 13) return "FOOD";
-            if (score == TRAP_SCORE) return "TRAP";
-            return String.valueOf(score);
+        private int toCellIndex(int x, int y) {
+            return (y * maze.width()) + x;
         }
 
-        static final class PlanRequest {
-            final MazeModel maze;
-            final Collection<Bait> baits;
-            final BotState start;
-            final @Nullable boolean[] occupiedCell;
-
-            PlanRequest(@NotNull MazeModel maze,
-                        @NotNull Collection<Bait> baits,
-                        @NotNull BotState start,
-                        @Nullable boolean[] occupiedCell) {
-                this.maze = maze;
-                this.baits = baits;
-                this.start = start;
-                this.occupiedCell = occupiedCell;
-            }
+        private int toStateIndex(int x, int y, int directionIndex) {
+            return (toCellIndex(x, y) * DIRECTION_COUNT) + directionIndex;
         }
 
-        static final class PlanResult {
-            private final Move firstMove;
-            private final double utility;
-            private final List<Point> path;
-            private final Point target;
-            private final String targetLabel;
-
-            PlanResult(@NotNull Move firstMove,
-                       double utility,
-                       @NotNull List<Point> path,
-                       @Nullable Point target,
-                       @Nullable String targetLabel) {
-                this.firstMove = firstMove;
-                this.utility = utility;
-                this.path = path;
-                this.target = target;
-                this.targetLabel = targetLabel;
-            }
-
-            Move firstMove() { return firstMove; }
-            double utility() { return utility; }
-            List<Point> path() { return path; }
-            @Nullable Point target() { return target; }
-            @Nullable String targetLabel() { return targetLabel; }
+        private int rotateLeft(int directionIndex) {
+            return (directionIndex + DIRECTION_COUNT - 1) % DIRECTION_COUNT;
         }
 
-        private static final class PlanInput {
-            final int w;
-            final int h;
-            final boolean[] walkable;
-            final boolean[] trapCell;
-            final @Nullable boolean[] occupiedCell;
-            final Bait[] candidates;
-
-            PlanInput(int w,
-                      int h,
-                      boolean[] walkable,
-                      boolean[] trapCell,
-                      @Nullable boolean[] occupiedCell,
-                      Bait[] candidates) {
-                this.w = w;
-                this.h = h;
-                this.walkable = walkable;
-                this.trapCell = trapCell;
-                this.occupiedCell = occupiedCell;
-                this.candidates = candidates;
-            }
-
-            boolean inBounds(int x, int y) {
-                return x >= 0 && y >= 0 && x < w && y < h;
-            }
-        }
-
-        private static final class Node {
-            final int x;
-            final int y;
-            final ViewDirection dir;
-            final int moves;
-            final int reward;
-            final int trapSteps;
-            final long collectedMask;
-            final Move firstMove;
-            final Node parent;
-
-            double utility;
-            double bound;
-            int tie;
-
-            Node(int x, int y, ViewDirection dir,
-                 int moves, int reward, int trapSteps,
-                 long collectedMask, Move firstMove,
-                 Node parent, double utility) {
-                this.x = x;
-                this.y = y;
-                this.dir = dir;
-                this.moves = moves;
-                this.reward = reward;
-                this.trapSteps = trapSteps;
-                this.collectedMask = collectedMask;
-                this.firstMove = firstMove;
-                this.parent = parent;
-                this.utility = utility;
-            }
-        }
-
-        private static final class StateKey {
-            final int x;
-            final int y;
-            final int d;
-            final long mask;
-
-            StateKey(Node n) {
-                this.x = n.x;
-                this.y = n.y;
-                this.d = n.dir.ordinal();
-                this.mask = n.collectedMask;
-            }
-
-            @Override public boolean equals(Object o) {
-                if (this == o) return true;
-                if (!(o instanceof StateKey)) return false;
-                StateKey k = (StateKey) o;
-                return x == k.x && y == k.y && d == k.d && mask == k.mask;
-            }
-
-            @Override public int hashCode() {
-                return 31 * (31 * (31 * x + y) + d) + (int) (mask ^ (mask >>> 32));
-            }
-        }
-
-        private static final class PlanVisual {
-            final List<Point> path;
-            final Point target;
-            final String label;
-
-            PlanVisual(List<Point> path, Point target, String label) {
-                this.path = path;
-                this.target = target;
-                this.label = label;
-            }
+        private int rotateRight(int directionIndex) {
+            return (directionIndex + 1) % DIRECTION_COUNT;
         }
     }
 }

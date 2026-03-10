@@ -17,11 +17,14 @@ public final class MaleniaControlPanel extends JPanel {
     public MaleniaControlPanel(AtomicBoolean paused) {
         this.paused = paused;
         this.pauseButton = new JButton(labelFor(paused.get()));
-        this.pauseButton.addActionListener(event -> {
-            this.paused.set(!this.paused.get());
-            this.pauseButton.setText(labelFor(this.paused.get()));
-        });
+        this.pauseButton.addActionListener(event -> togglePause());
         add(this.pauseButton);
+    }
+
+    private void togglePause() {
+        boolean nextPaused = !paused.get();
+        paused.set(nextPaused);
+        pauseButton.setText(labelFor(nextPaused));
     }
 
     private static String labelFor(boolean paused) {
